@@ -113,8 +113,14 @@ async def doctor(config):
             flag = "--help" if name in {"dnsgen", "massdns"} else "-h"
             async with runner.run(name, [flag], merge_stderr=True) as output:
                 help_text = output.read_text(encoding="utf-8", errors="replace")
-                if markers[name] not in help_text:
-                    raise ValueError("Unexpected CLI; check the configured executable/version")
+                required_flags = [markers[name]]
+                if name == "subfinder":
+                    required_flags.append("-recursive")
+                if name == "httpx":
+                    required_flags.append("-auto-referer")
+                missing = [flag for flag in required_flags if flag not in help_text]
+                if missing:
+                    raise ValueError("Missing flags: " + ", ".join(missing) + "; check/update the configured executable")
             print(f"OK    {name}: {executable}")
         except Exception as error:
             ok = False

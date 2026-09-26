@@ -33,6 +33,15 @@ def read_json(url: str, timeout: float, payload=None, max_bytes=32 * 1024 * 1024
     return json.loads(body)
 
 
+def read_text(url: str, timeout: float, max_bytes=1024 * 1024):
+    request = urllib.request.Request(url, headers={"User-Agent": "assetwatch/0.1"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise ToolError("Text response exceeded size limit")
+    return body.decode("utf-8")
+
+
 def json_lines(path: Path):
     with path.open(encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
@@ -77,7 +86,8 @@ class ToolRunner:
             await process.wait()
 
     @asynccontextmanager
-    async def run(self, name: str, args: list[str], input_path: Path | None = None, *, merge_stderr=False):
+    async def run(self, name: str, args: list[str], input_path: Path | None = None, *,
+                  merge_stderr=False, env=None, context=""):
         command = [self.config["tools"][name], *args]
         with tempfile.TemporaryDirectory(prefix="assetwatch-tool-") as directory:
             output, errors = Path(directory) / "stdout", Path(directory) / "stderr"
@@ -88,16 +98,33 @@ class ToolRunner:
                         process = await asyncio.create_subprocess_exec(
                             *command, stdin=stdin or asyncio.subprocess.DEVNULL,
                             stdout=stdout, stderr=stdout if merge_stderr else stderr,
+                            env={**os.environ, **env} if env is not None else None,
                             start_new_session=os.name == "posix")
                     except OSError as error:
                         raise ToolError(f"{name}: cannot execute configured tool ({error.strerror})") from error
+                    started = asyncio.get_running_loop().time()
+                    LOG.info("tool=%s %s state=started pid=%s", name, context, process.pid)
+                    waiter = asyncio.create_task(process.wait())
                     try:
-                        await asyncio.wait_for(process.wait(), self.config["runtime"]["tool_timeout"])
+                        async with asyncio.timeout(self.config["runtime"]["tool_timeout"]):
+                            while True:
+                                done, _ = await asyncio.wait(
+                                    {waiter}, timeout=self.config["runtime"]["progress_interval"])
+                                if done:
+                                    await waiter
+                                    break
+                                LOG.info("tool=%s %s state=running elapsed_seconds=%.1f output_bytes=%s stderr_bytes=%s",
+                                         name, context, asyncio.get_running_loop().time() - started,
+                                         output.stat().st_size, errors.stat().st_size)
                     except (TimeoutError, asyncio.CancelledError) as error:
                         await self.stop_process(process)
                         if isinstance(error, asyncio.CancelledError):
                             raise
                         raise ToolError(f"{name}: timeout; process group terminated") from error
+                    finally:
+                        if not waiter.done():
+                            waiter.cancel()
+                        await asyncio.gather(waiter, return_exceptions=True)
                 finally:
                     if stdin:
                         stdin.close()
@@ -132,7 +159,17 @@ class Tools:
                 raise ToolError("crtsh: expected a JSON array of certificates")
             yield (name for row in records for name in str(row.get("name_value", "")).splitlines())
         else:
-            async with self.runner.run(source, ["-d", domain, "-silent", "-duc"]) as path:
+            env = None
+            if source == "chaos":
+                # Keep the key out of argv and out of the parent process environment.
+                key = self.config["chaos"]["api_key"]
+                if key:
+                    env = {"PDCP_API_KEY": key, "CHAOS_KEY": key}
+            args = ["-d", domain, "-silent", "-duc"]
+            if source == "subfinder":
+                args.append("-recursive")
+            async with self.runner.run(source, args,
+                                       env=env, context=f"domain={domain}") as path:
                 yield text_lines(path)
 
     @asynccontextmanager
@@ -192,7 +229,7 @@ class Tools:
         with tempfile.TemporaryDirectory(prefix="assetwatch-http-") as directory:
             inputs = Path(directory) / "hosts.txt"
             inputs.write_text("\n".join(hostnames) + "\n", encoding="utf-8")
-            args = ["-json", "-silent", "-duc", "-sc", "-title", "-server", "-ip", "-probe",
+            args = ["-json", "-silent", "-duc", "-sc", "-title", "-server", "-ip", "-probe", "-auto-referer",
                     "-t", str(self.config["runtime"]["threads"])]
             async with self.runner.run("httpx", args, inputs) as path:
                 requested, results = set(hostnames), {}
@@ -237,7 +274,8 @@ class Tools:
             args += ["-mode", "bruteforce", "-w", str(wordlist)]
         else:
             args += ["-mode", "resolve", "-l", str(candidates)]
-        async with self.runner.run("shuffledns", args) as path:
+        mode = "static" if wordlist is not None else "dynamic"
+        async with self.runner.run("shuffledns", args, context=f"domain={domain} mode={mode}") as path:
             yield text_lines(path)
 
     @asynccontextmanager

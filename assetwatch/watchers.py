@@ -25,6 +25,7 @@ class Watchers:
             new += self.db.ingest(target["id"], batch, source)
             await asyncio.sleep(0)
         LOG.info("target=%s source=%s results=%s new_assets=%s", target["name"], source, total, new)
+        return new
 
     async def passive_discovery(self, target):
         success = True
@@ -79,6 +80,9 @@ class Watchers:
     async def dns_bruteforce(self, target):
         settings = self.config["dns_bruteforce"]
         success = True
+        LOG.info("target=%s watcher=dns_bruteforce static_enabled=%s dynamic_enabled=%s threads=%s",
+                 target["name"], settings["static"]["enabled"], settings["dynamic"]["enabled"],
+                 settings["shuffledns"]["threads"])
         if settings["static"]["enabled"]:
             directory = self.config.path(settings["static"]["wordlist_dir"])
             wordlists = sorted(path for path in directory.glob("*.txt") if path.is_file())
@@ -86,10 +90,14 @@ class Watchers:
                 success = False
                 LOG.warning("target=%s watcher=dns_bruteforce no_wordlists=%s", target["name"], directory)
             for domain in target["domains"]:
-                for wordlist in wordlists:
+                for number, wordlist in enumerate(wordlists, 1):
+                    LOG.info("target=%s domain=%s mode=static wordlist=%s wordlist_number=%s wordlists=%s state=started",
+                             target["name"], domain, wordlist, number, len(wordlists))
                     try:
                         async with self.tools.shuffledns(domain, wordlist=wordlist) as names:
-                            await self.ingest(target, names, "dns_bruteforce")
+                            new = await self.ingest(target, names, "dns_bruteforce")
+                        LOG.info("target=%s domain=%s mode=static wordlist=%s state=finished new_asset_events=%s",
+                                 target["name"], domain, wordlist, new)
                     except Exception as error:
                         success = False
                         LOG.error("target=%s domain=%s wordlist=%s error=%s", target["name"], domain, wordlist, error)
@@ -99,6 +107,7 @@ class Watchers:
             except Exception as error:
                 success = False
                 LOG.error("target=%s watcher=dynamic_bruteforce error=%s", target["name"], error)
+        LOG.info("target=%s watcher=dns_bruteforce state=complete success=%s", target["name"], success)
         return success
 
     async def dynamic_bruteforce(self, target):
@@ -110,7 +119,9 @@ class Watchers:
             failures = []
             seeds = new_candidates = 0
             try:
-                for batch in self.db.pending_dnsgen_batches(target["id"], seed_batch_size):
+                for number, batch in enumerate(self.db.pending_dnsgen_batches(target["id"], seed_batch_size), 1):
+                    LOG.info("target=%s mode=dynamic tool=dnsgen batch=%s seeds=%s state=started",
+                             target["name"], number, len(batch))
                     inputs.write_text("".join(asset["hostname"] + "\n" for asset in batch), encoding="utf-8")
                     async with self.tools.dnsgen(inputs) as names:
                         iterator = iter(names)
@@ -119,6 +130,8 @@ class Watchers:
                             await asyncio.sleep(0)
                     self.db.finish_dnsgen_batch(target["id"], batch[-1]["id"])
                     seeds += len(batch)
+                    LOG.info("target=%s mode=dynamic tool=dnsgen batch=%s state=finished seeds_processed=%s new_candidates=%s",
+                             target["name"], number, seeds, new_candidates)
             except Exception as error:
                 LOG.error("target=%s tool=dnsgen error=%s checkpoint_preserved=true", target["name"], error)
                 failures.append("dnsgen")
@@ -135,12 +148,17 @@ class Watchers:
                         count += len(batch)
                         await asyncio.sleep(0)
                 if path.stat().st_size:
-                    LOG.info("target=%s domain=%s mode=dynamic cached_candidates=%s", target["name"], domain, count)
+                    LOG.info("target=%s domain=%s mode=dynamic cached_candidates=%s state=started", target["name"], domain, count)
                     try:
                         async with self.tools.shuffledns(domain, candidates=path) as names:
-                            await self.ingest(target, names, "dns_bruteforce")
+                            new = await self.ingest(target, names, "dns_bruteforce")
+                        LOG.info("target=%s domain=%s mode=dynamic state=finished new_asset_events=%s",
+                                 target["name"], domain, new)
                     except Exception as error:
                         LOG.error("target=%s domain=%s mode=dynamic error=%s", target["name"], domain, error)
                         failures.append(domain)
+                else:
+                    LOG.info("target=%s domain=%s mode=dynamic state=skipped reason=no_cached_candidates",
+                             target["name"], domain)
             if failures:
                 raise RuntimeError("Dynamic brute force failed for: " + ", ".join(failures))

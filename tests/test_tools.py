@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from assetwatch.config import Config, DEFAULTS
 from assetwatch.database import Database
+from assetwatch.notifications import Notifier
 from assetwatch.tools import ToolError, ToolRunner, Tools
 from assetwatch.watchers import Watchers
 
@@ -72,6 +73,48 @@ class WrapperTests(unittest.IsolatedAsyncioTestCase):
             async with self.tools.passive("crtsh", "example.test") as names:
                 self.assertEqual(list(names), ["*.example.test", "api.example.test"])
         self.assertIn("q=%25.example.test", get.call_args.args[0])
+
+    async def test_yaml_chaos_key_overrides_only_child_environment(self):
+        script = self.path / "chaos"
+        script.write_text(f"#!{sys.executable}\n"
+                          "import os, sys\n"
+                          "assert os.environ['PDCP_API_KEY'] == os.environ['EXPECTED_KEY']\n"
+                          "assert os.environ['EXPECTED_KEY'] not in sys.argv\n"
+                          "print('api.example.test')\n")
+        script.chmod(0o755)
+        self.config["tools"]["chaos"] = str(script)
+        for key, expected in (("yaml-test-key", "yaml-test-key"), ("", "inherited-test-key")):
+            self.config["chaos"]["api_key"] = key
+            with patch.dict(os.environ, {"PDCP_API_KEY": "inherited-test-key", "EXPECTED_KEY": expected}):
+                async with self.tools.passive("chaos", "example.test") as names:
+                    self.assertEqual([name.strip() for name in names], ["api.example.test"])
+                self.assertEqual(os.environ["PDCP_API_KEY"], "inherited-test-key")
+
+    async def test_tool_progress_is_logged_before_process_finishes(self):
+        self.config["tools"]["dnsgen"] = sys.executable
+        self.config["runtime"]["progress_interval"] = 0.01
+        release = self.path / "release"
+        script = ("import pathlib, sys, time\n"
+                  "print('candidate.example.test', flush=True)\n"
+                  "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.01)\n")
+
+        async def run():
+            async with ToolRunner(self.config).run("dnsgen", ["-c", script, str(release)]) as output:
+                self.assertEqual(output.read_text().strip(), "candidate.example.test")
+
+        with self.assertLogs("assetwatch.tools", level="INFO") as logs:
+            task = asyncio.create_task(run())
+            try:
+                async with asyncio.timeout(2):
+                    while not any("state=running" in line for line in logs.output):
+                        await asyncio.sleep(0.005)
+                self.assertFalse(task.done())
+                release.touch()
+                await asyncio.wait_for(task, 2)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(any("output_bytes=" in line for line in logs.output))
 
     async def test_runner_nonzero_stderr_timeout_and_literal_arguments(self):
         self.config["tools"]["dnsx"] = sys.executable
@@ -175,6 +218,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unresolved.example.test", dnsgen_input)
         self.assertIn("api.example.org", dnsgen_input)
         for record in records:
+            if record["tool"] == "subfinder":
+                self.assertIn("-recursive", record["args"])
+            if record["tool"] == "chaos":
+                self.assertNotIn("-recursive", record["args"])
+            if record["tool"] == "httpx":
+                self.assertIn("-auto-referer", record["args"])
             if record["tool"] == "shuffledns":
                 args = record["args"]
                 self.assertEqual(args[args.index("-t") + 1], "10")
@@ -189,6 +238,25 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.watchers.tools, "dns", side_effect=ToolError("dnsx failed")):
             self.assertFalse(await self.watchers.dns_resolution(self.target))
         self.assertEqual(list(self.db.assets()), before)
+
+    async def test_bruteforce_logs_progress_and_delivers_each_new_asset_once(self):
+        for event in self.db.pending_events(100):
+            self.db.notification_result(event["id"])
+        self.config["telegram"].update(enabled=True, bot_token="test-token", chat_id="123", send_delay=0.001)
+        with self.assertLogs("assetwatch.watchers", level="INFO") as logs:
+            self.assertTrue(await self.watchers.dns_bruteforce(self.target))
+        for marker in ("mode=static", "tool=dnsgen batch=1", "mode=dynamic", "new_asset_events=", "state=complete success=True"):
+            self.assertTrue(any(marker in line for line in logs.output), marker)
+        notifier = Notifier(self.config, self.db)
+        with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
+            await notifier.flush()
+            self.assertGreater(send.call_count, 0)
+            self.assertTrue(all("DNS-Brute-Force New Asset" in call.args[2]["text"] for call in send.call_args_list))
+            sent = send.call_count
+            self.assertTrue(await self.watchers.dns_bruteforce(self.target))
+            await notifier.flush()
+            self.assertEqual(send.call_count, sent)
+        self.assertEqual(self.db.pending_events(100), [])
 
 
 if __name__ == "__main__":

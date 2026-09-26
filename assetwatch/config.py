@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -15,12 +16,18 @@ DEFAULTS = {
                   "dns_resolution": 1800, "http_probe": 1800,
                   "monitoring": 300, "dns_bruteforce": 604800},
     "runtime": {"batch_size": 500, "tool_timeout": 1800,
-                "request_timeout": 30, "threads": 10, "poll_interval": 1},
+                "request_timeout": 30, "threads": 10, "poll_interval": 1,
+                "progress_interval": 30},
+    "chaos": {"api_key": ""},
+    "cdn": {"enabled": True, "refresh_interval": 86400, "retry_interval": 3600,
+            "max_age": 604800,
+            "projectdiscovery_url": "https://raw.githubusercontent.com/projectdiscovery/cdncheck/main/sources_data.json",
+            "akamai_url": "https://techdocs.akamai.com/property-manager/pdfs/akamai_ipv4_CIDRs.txt"},
     "dns_bruteforce": {"static": {"enabled": True, "wordlist_dir": "./wordlists"},
                        "dynamic": {"enabled": True, "batch_size": 100},
                        "shuffledns": {"threads": 10, "resolvers": "./resolvers.txt"}},
     "telegram": {"enabled": False, "bot_token": "", "chat_id": "",
-                 "batch_size": 50, "send_delay": 1.1},
+                 "batch_size": 50, "send_delay": 1.1, "notify_dns_ip_changes": True},
     "logging": {"file": "./logs/assetwatch.log", "level": "INFO",
                 "max_bytes": 10485760, "backup_count": 5},
     "tools": {name: name for name in
@@ -84,10 +91,23 @@ def load_config(filename: str | Path = "config.yaml") -> Config:
         positive(value, f"intervals.{name}")
     for name, value in values["runtime"].items():
         positive(value, f"runtime.{name}", name in {"batch_size", "threads"})
-    for section in (values["telegram"], values["dns_bruteforce"]["static"],
+    for section in (values["telegram"], values["cdn"], values["dns_bruteforce"]["static"],
                     values["dns_bruteforce"]["dynamic"]):
         if not isinstance(section["enabled"], bool):
             raise ValueError("enabled values must be YAML true or false")
+    if not isinstance(values["telegram"]["notify_dns_ip_changes"], bool):
+        raise ValueError("telegram.notify_dns_ip_changes must be YAML true or false")
+    for key in ("refresh_interval", "retry_interval", "max_age"):
+        positive(values["cdn"][key], f"cdn.{key}")
+    if values["cdn"]["max_age"] < values["cdn"]["refresh_interval"]:
+        raise ValueError("cdn.max_age must be at least cdn.refresh_interval")
+    for key in ("projectdiscovery_url", "akamai_url"):
+        value = values["cdn"][key]
+        if not isinstance(value, str) or urlsplit(value).scheme != "https" or not urlsplit(value).netloc:
+            raise ValueError(f"cdn.{key} must be an HTTPS URL")
+    if not isinstance(values["chaos"]["api_key"], str):
+        raise ValueError("chaos.api_key must be a string")
+    values["chaos"]["api_key"] = values["chaos"]["api_key"].strip()
     positive(values["dns_bruteforce"]["shuffledns"]["threads"], "shuffledns.threads", True)
     positive(values["dns_bruteforce"]["dynamic"]["batch_size"], "dns_bruteforce.dynamic.batch_size", True)
     positive(values["telegram"]["batch_size"], "telegram.batch_size", True)

@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS notifications (
     attempted_at TEXT NOT NULL, success INTEGER NOT NULL,
     error TEXT, message_id TEXT
 );
+CREATE TABLE IF NOT EXISTS notification_suppressions (
+    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cdn_sources (
+    source TEXT PRIMARY KEY, fetched_at REAL NOT NULL, ranges TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS watcher_runs (
     target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
     watcher TEXT NOT NULL, finished_at REAL NOT NULL, success INTEGER NOT NULL,
@@ -323,10 +330,13 @@ class Database:
             for kind in http_events(before, status):
                 self._event(asset_id, kind, before, after)
 
-    def due(self, target_id: int, watcher: str, interval: float) -> bool:
+    def next_run_at(self, target_id: int, watcher: str, interval: float) -> float:
         row = self.connection.execute(
             "SELECT finished_at FROM watcher_runs WHERE target_id=? AND watcher=?", (target_id, watcher)).fetchone()
-        return row is None or row[0] + interval <= time.time()
+        return row[0] + interval if row else 0
+
+    def due(self, target_id: int, watcher: str, interval: float) -> bool:
+        return self.next_run_at(target_id, watcher, interval) <= time.time()
 
     def finished(self, target_id: int, watcher: str, success: bool):
         self.connection.execute(
@@ -334,12 +344,32 @@ class Database:
             "ON CONFLICT(target_id,watcher) DO UPDATE SET finished_at=excluded.finished_at,success=excluded.success",
             (watcher, time.time(), success, target_id))
 
-    def pending_events(self, limit: int):
+    def pending_events(self, limit: int, *, exclude_types=()):
+        # Filter before LIMIT so muted IP churn cannot starve discovery alerts.
+        exclusion = ""
+        if exclude_types:
+            exclusion = " AND e.event_type NOT IN (" + ",".join("?" for _ in exclude_types) + ")"
         rows = self.connection.execute(
             "SELECT e.*,a.hostname,t.name AS target FROM events e JOIN assets a ON a.id=e.asset_id "
             "JOIN targets t ON t.id=a.target_id WHERE e.delivered_at IS NULL AND e.next_attempt_at<=? "
-            "ORDER BY e.id LIMIT ?", (time.time(), limit)).fetchall()
+            "AND NOT EXISTS (SELECT 1 FROM notification_suppressions s WHERE s.event_id=e.id)"
+            + exclusion + " ORDER BY e.id LIMIT ?", (time.time(), *exclude_types, limit)).fetchall()
         return [dict(row) for row in rows]
+
+    def suppress_notification(self, event_id: int, reason: str):
+        self.connection.execute(
+            "INSERT OR IGNORE INTO notification_suppressions SELECT id,?,? FROM events WHERE id=?",
+            (reason, utcnow(), event_id))
+
+    def cdn_sources(self):
+        return {row["source"]: {"fetched_at": row["fetched_at"], "ranges": json.loads(row["ranges"])}
+                for row in self.connection.execute("SELECT * FROM cdn_sources")}
+
+    def cache_cdn_source(self, source: str, ranges: dict, fetched_at: float):
+        self.connection.execute(
+            "INSERT INTO cdn_sources VALUES (?,?,?) ON CONFLICT(source) "
+            "DO UPDATE SET fetched_at=excluded.fetched_at,ranges=excluded.ranges",
+            (source, fetched_at, json.dumps(ranges)))
 
     def notification_result(self, event_id: int, error=None, message_id=None, retry_after=0):
         with self.transaction():

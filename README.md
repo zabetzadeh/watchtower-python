@@ -32,8 +32,20 @@ same name; an explicit path such as `/home/you/go/bin/httpx` avoids that collisi
 The supplied config selects `${HOME}/go/bin/httpx`, matching this workspace's
 installed ProjectDiscovery binary; change it if your installation is elsewhere.
 crt.sh is queried through its JSON API; it has no required executable.
-Configure passive provider credentials using the tools' own configuration and
-environment variables (including `PDCP_API_KEY` for current Chaos releases).
+Configure other passive provider credentials using the tools' own configuration.
+Set the Chaos key in YAML (a literal string or an environment reference):
+
+```yaml
+chaos:
+  api_key: "${PDCP_API_KEY}"  # Or your actual Chaos key
+```
+
+`chaos.api_key` overrides inherited credentials for the Chaos subprocess only.
+An empty value preserves the tool's environment/configuration behavior. The key is
+passed through the child environment (`PDCP_API_KEY`, plus `CHAOS_KEY` for older
+clients), never command arguments, and is redacted from application logs.
+Current Chaos clients document `PDCP_API_KEY` in their
+[authentication guide](https://chaos.projectdiscovery.io/docs/api-key).
 
 Put your static wordlists (`*.txt`, one word per line) in `wordlists/`. Supply your
 chosen DNS resolver IPs, one per line, in `resolvers.txt`. Both paths are configurable.
@@ -70,7 +82,8 @@ Relative database, log, executable and wordlist paths follow the YAML file's
 directory. Bare executable names are resolved through PATH.
 
 Five independent asynchronous tasks run passive discovery, TLSX, DNSX, HTTPX and
-DNS brute force. A sixth drains notifications at `intervals.monitoring`; state
+DNS brute force. A sixth polls notifications at `intervals.monitoring`, draining
+full successful batches without waiting for another interval; state
 comparison happens immediately when observations are committed. Each task processes
 targets sequentially. Tools have bounded concurrency and a configurable overall
 timeout. Brute force has exclusive access to scan resources: it waits for active
@@ -79,6 +92,10 @@ sequentially while other scan jobs wait. This applies across all targets. Queued
 jobs resume afterward; their intervals still run from completion. Telegram delivery
 and CLI inspection remain available. Subfinder, Chaos and crt.sh run each passive
 cycle, with failures isolated by source and domain.
+Subfinder receives `-recursive`, selecting sources that support recursive
+subdomain queries; this flag alone does not repeatedly enumerate every discovered
+hostname. HTTPX receives `-auto-referer`, setting the Referer header to the request
+URL. `doctor` checks that the installed executables support both required flags.
 
 Intervals are seconds **after the previous run finishes**, persisted per target
 and watcher across restarts. Newly added targets are picked up without restarting.
@@ -113,6 +130,14 @@ candidate cache and checkpoint. Existing databases gain these tables automatical
 ShuffleDNS receives both `-t` and `-wt` from `dns_bruteforce.shuffledns.threads`,
 and invokes the configured MassDNS executable. Static and dynamic runs feed the
 same monitoring pipeline as passive and certificate discoveries.
+
+Brute-force logs show each domain/wordlist, DNSGen seed batch, cached candidate
+count and `new_asset_events` queued for notification. Tool heartbeats show elapsed
+time and output sizes every `runtime.progress_interval` seconds (default 30), even
+when a tool is silent. These are activity indicators, not a percentage of completed
+DNS queries. Output is ingested after each tool completes successfully. The scheduler
+logs queued/started jobs and the next run time, including persisted weekly schedules
+after a restart. `state=queued` means the watcher is waiting for scan resources.
 
 Ctrl+C and SIGTERM cancel watcher tasks, terminate tool process groups (including
 MassDNS children), and close the database. One daemon can own a database at a time;
@@ -150,6 +175,41 @@ Events: `fresh_asset`, `fresh_subdomain`, `dns_unresolved`, `dns_ip_changed`,
 Unchanged observations generate no new event. A later repeat of a real transition
 (200 → 403 → 200 → 403) creates a new event for each occurrence.
 
+IP changes are kept in SQLite and **notify by default, except known CDN address
+rotation**. The filter compares the old and new IP sets against downloaded provider
+CIDRs. It skips an alert only when every added/removed address is a known CDN IP
+and the set of providers stays the same. An unchanged origin IP alongside rotating
+CDN IPs is fine; an origin IP change, unknown IP, provider migration, or move onto/off
+a CDN still alerts. DNS resolution/loss and HTTP changes always retain their normal
+notification behavior.
+
+The public range sources are ProjectDiscovery's
+[CDN/WAF dataset](https://github.com/projectdiscovery/cdncheck/blob/main/sources_data.json)
+and [Akamai's published IPv4 CIDRs](https://techdocs.akamai.com/property-manager/pdfs/akamai_ipv4_CIDRs.txt).
+They cover ArvanCloud, Cloudflare, Akamai, Fastly, CloudFront and other listed
+providers. Cloud-hosting ranges and CNAME suffixes in the ProjectDiscovery dataset
+are excluded. Coverage depends on those feeds; an unmatched IP remains eligible for
+alerts. No target hostnames or IPs are sent to the range feeds.
+
+Ranges are fetched when an IP-change notification needs classification, cached in
+the same SQLite database, and refreshed after `cdn.refresh_interval` (default one
+day). Failed or malformed downloads preserve each source's last good cache and retry
+after `cdn.retry_interval`. Once a source exceeds `cdn.max_age` (default seven days),
+its ranges cannot suppress alerts. Updates replace the old ranges, so removed CIDRs
+stop matching. Both URLs are configurable as `cdn.projectdiscovery_url` and
+`cdn.akamai_url`, using the same JSON/text formats as the default feeds.
+Downloads verify HTTPS certificates. If a Python installation lacks its CA bundle
+(`cause=SSLCertVerificationError` in the log), configure its trust store. On this
+macOS workspace, the existing system bundle works with
+`SSL_CERT_FILE=/etc/ssl/cert.pem`; set it in the daemon's environment before startup.
+
+Suppressed events retain their full state history and a durable suppression reason;
+they are logged as `telegram=suppressed` and are never marked as delivered. They do
+not re-enter the queue after restart. Set `cdn.enabled: false` to notify on all future
+IP changes, or `telegram.notify_dns_ip_changes: false` to mute all IP-only alerts.
+If upgrading from the previous global mute, set `notify_dns_ip_changes: true` in
+your existing YAML: its undelivered backlog will then pass through the CDN filter.
+
 DNSX uses explicit NOERROR/NXDOMAIN observations. SERVFAIL, REFUSED, omitted results,
 failed executables, timeouts and malformed output preserve previous state. HTTPX
 uses explicit probe failures to mark a service unavailable; missing rows are
@@ -166,8 +226,36 @@ export TELEGRAM_CHAT_ID='your-chat-id'
 # Set telegram.enabled: true in config.yaml, then start assetwatch run.
 ```
 
+Useful settings for timely alerts and visible brute-force activity:
+
+```yaml
+intervals:
+  monitoring: 30          # Telegram polling only; separate from DNS/HTTP scans
+runtime:
+  progress_interval: 30   # Seconds between running-tool heartbeats
+telegram:
+  notify_dns_ip_changes: true
+cdn:
+  enabled: true
+  refresh_interval: 86400
+  retry_interval: 3600
+  max_age: 604800
+```
+
+Brute force sends a fresh-asset alert only for a hostname newly inserted into the
+target's asset table. Rediscovering an existing hostname records its source without
+another fresh-asset alert; zero new findings means zero such alerts. Check
+`new_asset_events` in the logs, `telegram=disabled`/`telegram=failed`, and the scheduled
+next run when diagnosing missing messages. A successful delivery logs its event
+type and ID. Delivery requires `telegram.enabled: true` and valid credentials.
+The outbox interval controls how soon new events are picked up: 12000 means up to
+3 hours 20 minutes even before any delivery backlog. Existing eligible backlogs
+now drain continuously in bounded batches, respecting `telegram.send_delay` and
+server retry delays.
+
 State and its event commit atomically. Events queue while Telegram is disabled or
-unreachable and are delivered after it is enabled, including the existing backlog.
+unreachable and are delivered after it is enabled, including the existing backlog,
+subject to the configured IP-alert policy and CDN filter.
 Acknowledged events are not resent; failed attempts and server retry delays are
 stored. Plain-text messages avoid Markdown injection. Fresh assets may show
 DNS/HTTP `PENDING`; later transitions arrive separately.

@@ -5,6 +5,7 @@ import json
 import logging
 import urllib.error
 
+from .cdn import CdnRanges
 from .tools import read_json
 
 LOG = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ def format_event(event: dict) -> str:
     if event["event_type"] == "fresh_asset":
         title = {"tlsx": "🆕 Certificate-derived New Asset",
                  "dns_bruteforce": "🆕 DNS-Brute-Force New Asset"}.get(after.get("source"), title)
-    lines = [title, "", f"Target: {event['target']}", f"Host: {event['hostname']}"]
+    lines = [title, "", f"Target: {event['target']}", f"Subdomain: {event['hostname']}"]
     if after.get("source"):
         lines.append(f"Source: {after['source']}")
     if event["event_type"] == "http_status_changed":
@@ -49,12 +50,29 @@ def format_event(event: dict) -> str:
 class Notifier:
     def __init__(self, config, database):
         self.config, self.db = config, database
+        self.cdn = CdnRanges(config, database)
 
     async def flush(self):
         settings = self.config["telegram"]
         if not settings["enabled"]:
-            return
-        for event in self.db.pending_events(settings["batch_size"]):
+            return False
+        excluded = () if settings["notify_dns_ip_changes"] else ("dns_ip_changed",)
+        events = self.db.pending_events(settings["batch_size"], exclude_types=excluded)
+        if any(event["event_type"] == "dns_ip_changed" for event in events):
+            await self.cdn.refresh()
+        if events:
+            LOG.info("telegram=sending batch_events=%s oldest_event_at=%s",
+                     len(events), events[0]["created_at"])
+        for event in events:
+            if event["event_type"] == "dns_ip_changed":
+                before, after = json.loads(event["previous_state"]), json.loads(event["new_state"])
+                providers = self.cdn.rotation_providers(before["ip_addresses"], after["ip_addresses"])
+                if providers:
+                    reason = "cdn_ip_rotation:" + ",".join(sorted(providers))
+                    self.db.suppress_notification(event["id"], reason)
+                    LOG.info("telegram=suppressed event_id=%s target=%s host=%s reason=%s",
+                             event["id"], event["target"], event["hostname"], reason)
+                    continue
             retry_after = self.config["intervals"]["monitoring"]
             try:
                 result = await asyncio.to_thread(
@@ -67,7 +85,8 @@ class Notifier:
                         retry_after = max(retry_after, float(result.get("parameters", {}).get("retry_after", 0)))
                     raise ValueError("Telegram rejected the message")
                 self.db.notification_result(event["id"], message_id=result.get("result", {}).get("message_id"))
-                LOG.info("telegram=delivered event_id=%s target=%s host=%s", event["id"], event["target"], event["hostname"])
+                LOG.info("telegram=delivered event_id=%s event=%s target=%s host=%s",
+                         event["id"], event["event_type"], event["target"], event["hostname"])
             except Exception as error:
                 if isinstance(error, urllib.error.HTTPError):
                     try:
@@ -79,5 +98,7 @@ class Notifier:
                 reason = f"Telegram delivery failed ({type(error).__name__})"
                 self.db.notification_result(event["id"], error=reason, retry_after=retry_after)
                 LOG.error("telegram=failed event_id=%s reason=%s retry_after=%s", event["id"], reason, retry_after)
-                break
+                return False
             await asyncio.sleep(settings["send_delay"])
+        # Drain a full successful batch without another monitoring-interval delay.
+        return len(events) == settings["batch_size"]

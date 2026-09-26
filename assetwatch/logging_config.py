@@ -24,7 +24,8 @@ def configure_logging(config):
     handlers = [logging.StreamHandler(), RotatingFileHandler(
         path, maxBytes=settings["max_bytes"], backupCount=settings["backup_count"], encoding="utf-8")]
     formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(message)s")
-    secrets = [config["telegram"]["bot_token"], os.environ.get("PDCP_API_KEY"), os.environ.get("CHAOS_KEY")]
+    secrets = [config["telegram"]["bot_token"], config["chaos"]["api_key"],
+               os.environ.get("PDCP_API_KEY"), os.environ.get("CHAOS_KEY")]
     for handler in handlers:
         handler.setFormatter(formatter)
         handler.addFilter(SecretFilter(secrets))

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import io
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -15,6 +16,7 @@ import yaml
 from assetwatch.cli import main
 from assetwatch.config import Config, DEFAULTS, load_config
 from assetwatch.database import Database
+from assetwatch.logging_config import configure_logging
 from assetwatch.normalization import in_scope, ipv4_addresses, normalize_hostname
 from assetwatch.notifications import Notifier, format_event
 from assetwatch.scheduler import Scheduler, daemon_lock
@@ -159,6 +161,43 @@ class DatabaseCase(unittest.TestCase):
         self.assertIn("Certificate-derived New Asset", message)
         self.assertIn("DNS: PENDING", message)
 
+    def test_global_ip_mute_is_retained_without_blocking_bruteforce_and_outage_alerts(self):
+        self.config["telegram"].update(enabled=True, bot_token="test-token", chat_id="123",
+                                       batch_size=2, send_delay=0.001, notify_dns_ip_changes=False)
+        self.config["cdn"]["enabled"] = False
+        asset = self.asset()
+        self.db.observe_dns(asset["id"], ["192.0.2.1"])
+        self.observe(200)
+        for event in self.db.pending_events(100):
+            self.db.notification_result(event["id"])
+        for number in range(2, 6):
+            self.db.observe_dns(asset["id"], [f"192.0.2.{number}"])
+        self.assertEqual(self.asset()["ip_addresses"], ["192.0.2.5"])
+        self.assertEqual(self.kinds().count("dns_ip_changed"), 4)
+        self.db.ingest(self.target["id"], ["new.example.test"], "dns_bruteforce")
+        self.db.observe_dns(asset["id"], [])
+        # Exercise a pre-existing outbox on restart, including more IP events than a batch.
+        self.db.close()
+        self.db = Database(self.path / "assets.db")
+        notifier = Notifier(self.config, self.db)
+        with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
+            self.assertTrue(asyncio.run(notifier.flush()))
+            self.assertFalse(asyncio.run(notifier.flush()))
+            self.assertEqual(send.call_count, 3)
+            messages = [call.args[2]["text"] for call in send.call_args_list]
+            self.assertIn("DNS-Brute-Force New Asset", messages[0])
+            self.assertIn("DNS Unresolved", messages[1])
+            self.assertIn("HTTP Service Disappeared", messages[2])
+            self.assertEqual({row["event_type"] for row in self.db.pending_events(100)}, {"dns_ip_changed"})
+            self.assertFalse(asyncio.run(notifier.flush()))
+            self.assertEqual(send.call_count, 3)
+            self.config["telegram"]["notify_dns_ip_changes"] = True
+            self.assertTrue(asyncio.run(notifier.flush()))
+            self.assertTrue(asyncio.run(notifier.flush()))
+            self.assertFalse(asyncio.run(notifier.flush()))
+            self.assertEqual(send.call_count, 7)
+        self.assertEqual(self.db.pending_events(100), [])
+
 
 class NormalizationTests(unittest.TestCase):
     def test_hostnames(self):
@@ -191,10 +230,36 @@ class ConfigAndCliTests(unittest.TestCase):
                          {"dns_bruteforce": {"shuffledns": {"threads": -1}}},
                          {"dns_bruteforce": {"dynamic": {"batch_size": 0}}},
                          {"dns_bruteforce": {"dynamic": {"batch_size": 1.5}}},
+                         {"runtime": {"progress_interval": 0}}, {"chaos": {"api_key": 123}},
+                         {"telegram": {"notify_dns_ip_changes": "false"}},
+                         {"cdn": {"enabled": "true"}}, {"cdn": {"refresh_interval": 0}},
+                         {"cdn": {"retry_interval": -1}}, {"cdn": {"max_age": 1}},
+                         {"cdn": {"akamai_url": "file:///tmp/ips"}},
                          {"telegram": {"enabled": "false"}}, {"intervals": {"typo": 2}}):
             self.filename.write_text(yaml.safe_dump(document))
             with self.assertRaises(ValueError):
                 load_config(self.filename)
+
+    def test_chaos_key_from_yaml_literal_or_environment(self):
+        for value in ("test-chaos-key", "${TEST_CHAOS_KEY}"):
+            self.filename.write_text(yaml.safe_dump({"chaos": {"api_key": value}}))
+            with patch.dict(os.environ, {"TEST_CHAOS_KEY": "test-chaos-key"}):
+                self.assertEqual(load_config(self.filename)["chaos"]["api_key"], "test-chaos-key")
+
+    def test_yaml_chaos_key_is_redacted_by_terminal_and_file_handlers(self):
+        config = Config(copy.deepcopy(DEFAULTS), self.path)
+        config["chaos"]["api_key"] = "yaml-test-secret"
+        with patch("assetwatch.logging_config.logging.basicConfig") as setup:
+            configure_logging(config)
+        for handler in setup.call_args.kwargs["handlers"]:
+            try:
+                record = logging.LogRecord("tool", logging.WARNING, "", 0,
+                                           "stderr: %s", ("yaml-test-secret",), None)
+                handler.filter(record)
+                self.assertNotIn("yaml-test-secret", record.getMessage())
+                self.assertIn("[REDACTED]", record.getMessage())
+            finally:
+                handler.close()
 
     def call(self, *args):
         out, err = io.StringIO(), io.StringIO()
@@ -226,6 +291,28 @@ class ConfigAndCliTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_notification_batches_drain_without_poll_delay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(copy.deepcopy(DEFAULTS), Path(directory))
+            config["telegram"].update(enabled=True, bot_token="test-token", chat_id="123",
+                                       batch_size=1, send_delay=0.001)
+            config["intervals"]["monitoring"] = 12000
+            db = Database(Path(directory) / "assets.db")
+            self.addCleanup(db.close)
+            target = db.add_target("one", ["example.test"], [])
+            db.ingest(target["id"], ["new.example.test"], "dns_bruteforce")
+            scheduler = Scheduler(config, db)
+            with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
+                task = asyncio.create_task(scheduler.monitoring())
+                try:
+                    async with asyncio.timeout(2):
+                        while db.pending_events(10):
+                            await asyncio.sleep(0.005)
+                    self.assertEqual(send.call_count, 2)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
     async def test_recurrence_failure_isolation_and_no_overlap(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(copy.deepcopy(DEFAULTS), Path(directory))

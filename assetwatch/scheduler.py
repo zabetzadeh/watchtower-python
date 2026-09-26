@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 
 from .notifications import Notifier
 from .watchers import Watchers
@@ -73,10 +74,16 @@ class Scheduler:
 
     async def watch(self, name):
         interval = self.config["intervals"][name]
+        announced = set()
         while True:
             try:
                 for target in self.db.targets():
                     if not self.db.due(target["id"], name, interval):
+                        if target["id"] not in announced:
+                            next_run = self.db.next_run_at(target["id"], name, interval)
+                            LOG.info("watcher=%s target=%s state=scheduled next_run=%s",
+                                     name, target["name"], datetime.fromtimestamp(next_run, timezone.utc).isoformat())
+                            announced.add(target["id"])
                         continue
                     LOG.info("watcher=%s target=%s state=queued", name, target["name"])
                     success = False
@@ -87,7 +94,10 @@ class Scheduler:
                     except Exception as error:
                         LOG.error("watcher=%s target=%s state=failed error=%s", name, target["name"], error)
                     self.db.finished(target["id"], name, bool(success))
-                    LOG.info("watcher=%s target=%s state=finished success=%s", name, target["name"], success)
+                    next_run = self.db.next_run_at(target["id"], name, interval)
+                    LOG.info("watcher=%s target=%s state=finished success=%s next_run=%s",
+                             name, target["name"], success, datetime.fromtimestamp(next_run, timezone.utc).isoformat())
+                    announced.add(target["id"])
             except Exception as error:
                 LOG.error("watcher=%s scheduler_error=%s", name, error)
             await asyncio.sleep(self.config["runtime"]["poll_interval"])
@@ -95,7 +105,9 @@ class Scheduler:
     async def monitoring(self):
         while True:
             try:
-                await self.notifier.flush()
+                if await self.notifier.flush():
+                    await asyncio.sleep(0)
+                    continue
             except Exception as error:
                 LOG.error("watcher=monitoring error=%s", error)
             await asyncio.sleep(self.config["intervals"]["monitoring"])
@@ -110,6 +122,11 @@ class Scheduler:
         tasks = [asyncio.create_task(self.watch(name), name=name) for name in WATCHERS]
         tasks.append(asyncio.create_task(self.monitoring(), name="monitoring"))
         LOG.info("daemon=started targets=%s watchers=%s", len(self.db.targets()), len(tasks))
+        if not self.config["telegram"]["enabled"]:
+            LOG.warning("telegram=disabled events_are_stored=true enable=telegram.enabled")
+        else:
+            LOG.info("telegram=enabled poll_interval=%s notify_dns_ip_changes=%s",
+                     self.config["intervals"]["monitoring"], self.config["telegram"]["notify_dns_ip_changes"])
         try:
             await stop.wait()
         finally:
