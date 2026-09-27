@@ -167,6 +167,7 @@ class Database:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=10000")
         self.connection.executescript(SCHEMA)
+        self.on_event = None
         self.migrate()
 
     def migrate(self):
@@ -229,10 +230,12 @@ class Database:
         name = name.strip()
         if not name or len(name) > 200 or any(ord(c) < 32 for c in name):
             raise ValueError("Target name must contain 1–200 printable characters")
-        normalized = [normalize_hostname(domain) for domain in domains]
-        if not normalized or not all(normalized):
-            raise ValueError("Provide at least one valid root domain (without a URL or port)")
+        normalized = [h for domain in domains if (h := normalize_hostname(domain))]
+        if domains and len(normalized) != len(domains):
+            raise ValueError("Provide valid root domain(s) (without a URL or port)")
         networks = sorted({str(ipaddress.ip_network(cidr, strict=True)) for cidr in cidrs})
+        if not normalized and not networks:
+            raise ValueError("Provide at least one valid root domain or CIDR")
         now = utcnow()
         with self.transaction():
             cursor = self.connection.execute("INSERT INTO targets(name,created_at) VALUES (?,?)", (name, now))
@@ -242,8 +245,31 @@ class Database:
             self.connection.executemany("INSERT INTO target_cidrs VALUES (?,?)",
                                         [(target_id, cidr) for cidr in networks])
         target = self.target(name)
-        self.ingest(target_id, target["domains"], "target")
+        if target["domains"]:
+            self.ingest(target_id, target["domains"], "target")
         return target
+
+    def update_target(self, name: str, domains: list[str] | None = None, cidrs: list[str] | None = None) -> dict:
+        target = self.target(name)
+        target_id = target["id"]
+        domains = domains or []
+        cidrs = cidrs or []
+        normalized = [h for domain in domains if (h := normalize_hostname(domain))]
+        if domains and len(normalized) != len(domains):
+            raise ValueError("Provide valid domain(s) (without a URL or port)")
+        networks = sorted({str(ipaddress.ip_network(cidr, strict=True)) for cidr in cidrs})
+        if not normalized and not networks:
+            raise ValueError("Provide at least one valid domain or CIDR to update")
+        with self.transaction():
+            if normalized:
+                self.connection.executemany("INSERT OR IGNORE INTO target_domains VALUES (?,?)",
+                                            [(target_id, domain) for domain in sorted(set(normalized))])
+            if networks:
+                self.connection.executemany("INSERT OR IGNORE INTO target_cidrs VALUES (?,?)",
+                                            [(target_id, cidr) for cidr in networks])
+        if normalized:
+            self.ingest(target_id, normalized, "target")
+        return self.target(name)
 
     def remove_target(self, name: str):
         with self.transaction():
@@ -255,18 +281,27 @@ class Database:
             "INSERT INTO events(asset_id,event_type,previous_state,new_state,created_at) VALUES (?,?,?,?,?)",
             (asset_id, kind, json.dumps(before), json.dumps(after), utcnow()))
         LOG.info("event=%s target_id=%s host=%s", kind, after.get("target_id"), after.get("hostname"))
+        if self.on_event is not None:
+            try:
+                self.on_event()
+            except Exception:
+                pass
 
     def ingest(self, target_id: int, hostnames, source: str) -> int:
         new = 0
         with self.transaction():
             domains = [row[0] for row in self.connection.execute(
                 "SELECT domain FROM target_domains WHERE target_id=?", (target_id,))]
-            if not domains:  # A target may have been removed while its tool was running.
+            has_cidrs = bool(self.connection.execute(
+                "SELECT 1 FROM target_cidrs WHERE target_id=?", (target_id,)).fetchone())
+            if not domains and not has_cidrs:  # A target may have been removed while its tool was running.
                 return 0
             now = utcnow()
             for raw in hostnames:
                 hostname = normalize_hostname(raw)
-                if not hostname or not in_scope(hostname, domains):
+                if not hostname:
+                    continue
+                if domains and not in_scope(hostname, domains):
                     continue
                 cursor = self.connection.execute(
                     "INSERT OR IGNORE INTO assets(target_id,hostname,first_seen,last_seen) VALUES (?,?,?,?)",
@@ -283,7 +318,7 @@ class Database:
                     new += 1
         return new
 
-    def assets(self, target_id=None, resolved=None, http=None, status=None, source=None):
+    def assets(self, target_id=None, resolved=None, http=None, status=None, source=None, sources=None, limit=None, offset=None):
         clauses, params = [], []
         for column, value in (("target_id", target_id), ("dns_resolved", resolved),
                               ("http_available", http), ("http_status", status)):
@@ -293,10 +328,19 @@ class Database:
         if source is not None:
             clauses.append("EXISTS (SELECT 1 FROM asset_sources s WHERE s.asset_id=a.id AND s.source=?)")
             params.append(source)
+        if sources:
+            placeholders = ",".join("?" for _ in sources)
+            clauses.append(f"EXISTS (SELECT 1 FROM asset_sources s WHERE s.asset_id=a.id AND s.source IN ({placeholders}))")
+            params.extend(sources)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        pagination = ""
+        if limit is not None:
+            pagination += f" LIMIT {int(limit)}"
+            if offset is not None:
+                pagination += f" OFFSET {int(offset)}"
         cursor = self.connection.execute(
             "SELECT a.*,t.name AS target FROM assets a JOIN targets t ON t.id=a.target_id"
-            + where + " ORDER BY a.hostname,t.name", params)
+            + where + " ORDER BY a.hostname,t.name" + pagination, params)
         for row in cursor:
             asset = decode_asset(row)
             asset["sources"] = [r[0] for r in self.connection.execute(

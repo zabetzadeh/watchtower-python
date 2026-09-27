@@ -63,10 +63,16 @@ def parser():
     actions = target.add_subparsers(dest="action", required=True)
     add = actions.add_parser("add")
     add.add_argument("name")
-    add.add_argument("--domain", action="extend", type=comma_separated, required=True,
+    add.add_argument("--domain", action="extend", type=comma_separated, default=[],
                      help="Root domains, comma-separated; flag may also be repeated")
     add.add_argument("--cidr", action="extend", type=comma_separated, default=[],
                      help="Authorized CIDRs, comma-separated; flag may also be repeated")
+    update = actions.add_parser("update")
+    update.add_argument("name")
+    update.add_argument("--domain", action="extend", type=comma_separated, default=[],
+                        help="Root domains, comma-separated; flag may also be repeated")
+    update.add_argument("--cidr", action="extend", type=comma_separated, default=[],
+                        help="Authorized CIDRs, comma-separated; flag may also be repeated")
     listing = actions.add_parser("list")
     listing.add_argument("--format", choices=("text", "json"), default="text")
     show = actions.add_parser("show")
@@ -222,7 +228,13 @@ def main(argv=None):
             print_targets(database.targets(), arguments.format)
         elif arguments.command == "target":
             if arguments.action == "add":
+                if not arguments.domain and not arguments.cidr:
+                    raise ValueError("Provide at least one --domain or --cidr")
                 print_targets([database.add_target(arguments.name, arguments.domain, arguments.cidr)], "text")
+            elif arguments.action == "update":
+                if not arguments.domain and not arguments.cidr:
+                    raise ValueError("Provide at least one --domain or --cidr to update")
+                print_targets([database.update_target(arguments.name, arguments.domain, arguments.cidr)], "text")
             elif arguments.action == "show":
                 print_targets([database.target(arguments.name)], arguments.format)
             elif arguments.action == "remove":

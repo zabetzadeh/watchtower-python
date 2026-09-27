@@ -31,9 +31,9 @@ DEFAULTS = {
             "max_age": 604800,
             "projectdiscovery_url": "https://raw.githubusercontent.com/projectdiscovery/cdncheck/main/sources_data.json",
             "akamai_url": "https://techdocs.akamai.com/property-manager/pdfs/akamai_ipv4_CIDRs.txt"},
-    "dns_bruteforce": {"static": {"enabled": True, "wordlist_dir": "./wordlists"},
-                       "dynamic": {"enabled": True, "batch_size": 100},
-                       "shuffledns": {"threads": 10, "resolvers": "./resolvers.txt"}},
+    "dns_bruteforce": {"static": {"enabled": True, "wordlist_dir": "./wordlists", "chunk_size": 5000},
+                       "dynamic": {"enabled": True, "batch_size": 100, "chunk_size": 5000},
+                       "shuffledns": {"threads": 10, "resolvers": "./resolvers.txt", "cooldown": 1.0}},
     "telegram": {"enabled": False, "bot_token": "", "chat_id": "",
                  "batch_size": 50, "send_delay": 1.1, "notify_dns_ip_changes": True,
                  "commands_enabled": True, "command_poll_interval": 3},
@@ -123,6 +123,10 @@ def load_config(filename: str | Path = "config.yaml") -> Config:
     values["chaos"]["api_key"] = values["chaos"]["api_key"].strip()
     positive(values["dns_bruteforce"]["shuffledns"]["threads"], "shuffledns.threads", True)
     positive(values["dns_bruteforce"]["dynamic"]["batch_size"], "dns_bruteforce.dynamic.batch_size", True)
+    positive(values["dns_bruteforce"]["static"]["chunk_size"], "dns_bruteforce.static.chunk_size", True)
+    positive(values["dns_bruteforce"]["dynamic"]["chunk_size"], "dns_bruteforce.dynamic.chunk_size", True)
+    if not isinstance(values["dns_bruteforce"]["shuffledns"]["cooldown"], (int, float)) or values["dns_bruteforce"]["shuffledns"]["cooldown"] < 0:
+        raise ValueError("dns_bruteforce.shuffledns.cooldown must be a non-negative number")
     positive(values["telegram"]["batch_size"], "telegram.batch_size", True)
     positive(values["telegram"]["send_delay"], "telegram.send_delay")
     for key in ("max_bytes", "backup_count"):

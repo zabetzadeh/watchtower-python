@@ -30,8 +30,14 @@ class DynamicTools:
         yield iter(names + ["*." + name.upper() + "." for name in names] + ["outside.invalid"])
 
     @asynccontextmanager
-    async def shuffledns(self, domain, *, candidates):
-        self.resolved.append((domain, candidates.read_text().splitlines()))
+    async def shuffledns(self, domain, *, candidates=None, wordlist=None):
+        if candidates is not None:
+            self.resolved.append((domain, candidates.read_text().splitlines()))
+        if wordlist is not None:
+            words = wordlist.read_text().splitlines()
+            self.resolved.append((domain, words))
+            yield iter([w + "." + domain for w in words])
+            return
         if self.fail_resolution:
             raise ToolError("resolution failed")
         yield iter(())  # Cached candidates remain unresolved and must be retried.
@@ -141,6 +147,52 @@ class IncrementalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.db.assets()), before)
         await self.watchers.dynamic_bruteforce(self.target)
         self.assertEqual(len(self.candidates()), 2)
+
+    async def test_static_bruteforce_wordlist_chunking(self):
+        wordlist_dir = self.path / "wordlists"
+        wordlist_dir.mkdir(parents=True, exist_ok=True)
+        wordlist_file = wordlist_dir / "test.txt"
+        # Write 7 words
+        wordlist_file.write_text("\n".join(f"sub{i}" for i in range(7)) + "\n")
+        resolvers_file = self.path / "resolvers.txt"
+        resolvers_file.write_text("1.1.1.1\n")
+
+        self.config["dns_bruteforce"]["static"]["wordlist_dir"] = str(wordlist_dir)
+        self.config["dns_bruteforce"]["static"]["chunk_size"] = 3
+        self.config["dns_bruteforce"]["shuffledns"]["resolvers"] = str(resolvers_file)
+        self.config["dns_bruteforce"]["shuffledns"]["cooldown"] = 0.001
+        self.config["dns_bruteforce"]["dynamic"]["enabled"] = False
+
+        self.tools.resolved.clear()
+        success = await self.watchers.dns_bruteforce(self.target)
+        self.assertTrue(success)
+
+        # 2 domains * (3 chunks of size 3, 3, 1) = 6 resolved calls
+        chunk_calls = [c for c in self.tools.resolved if c[0] == "example.test"]
+        self.assertEqual(len(chunk_calls), 3)
+        self.assertEqual(len(chunk_calls[0][1]), 3)
+        self.assertEqual(len(chunk_calls[1][1]), 3)
+        self.assertEqual(len(chunk_calls[2][1]), 1)
+
+        # Check all 7 subdomains ingested
+        assets = [a["hostname"] for a in self.db.assets(self.target["id"])]
+        for i in range(7):
+            self.assertIn(f"sub{i}.example.test", assets)
+
+    async def test_target_management_cidr_and_domain(self):
+        # Target with only CIDR
+        cidr_target = self.db.add_target("cidr_only", [], ["10.0.0.0/24"])
+        self.assertEqual(cidr_target["domains"], [])
+        self.assertEqual(cidr_target["cidrs"], ["10.0.0.0/24"])
+
+        # Passive discovery and brute force gracefully skip without domain
+        self.assertTrue(await self.watchers.passive_discovery(cidr_target))
+        self.assertTrue(await self.watchers.dns_bruteforce(cidr_target))
+
+        # Update target with new domain and CIDR
+        updated = self.db.update_target("cidr_only", ["mycorp.test"], ["10.1.0.0/24"])
+        self.assertEqual(updated["domains"], ["mycorp.test"])
+        self.assertEqual(sorted(updated["cidrs"]), ["10.0.0.0/24", "10.1.0.0/24"])
 
 
 class ScanGateTests(unittest.IsolatedAsyncioTestCase):

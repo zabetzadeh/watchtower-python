@@ -4,7 +4,7 @@ import asyncio
 import logging
 import signal
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timezone
 
 from .notifications import Notifier
@@ -50,10 +50,9 @@ class ScanGate:
                 self.waiting_exclusive += 1
                 try:
                     await self.condition.wait_for(lambda: not self.exclusive and self.active == 0)
+                    self.exclusive = True
                 finally:
                     self.waiting_exclusive -= 1
-                    self.condition.notify_all()
-                self.exclusive = True
             else:
                 # Once brute force is queued, let existing scans drain before admitting more.
                 await self.condition.wait_for(lambda: not self.exclusive and self.waiting_exclusive == 0)
@@ -72,10 +71,13 @@ class ScanGate:
 class Scheduler:
     def __init__(self, config, database, watchers=None, notifier=None):
         self.config, self.db = config, database
+        self.notify_wake = asyncio.Event()
+        self.db.on_event = self.notify_wake.set
         self.watchers = watchers or Watchers(config, database)
         self.notifier = notifier or Notifier(config, database)
         self.programs = ProgramWatcher(config, database)
         self.scans = ScanGate()
+        self.bruteforce_lock = asyncio.Lock()
 
     async def watch(self, name):
         interval = self.config["intervals"][name]
@@ -97,11 +99,12 @@ class Scheduler:
                                           else "Waiting for brute-force scan access")
                     success = False
                     try:
-                        async with self.scans.slot(exclusive=name == "dns_bruteforce"):
-                            self.db.consume_run_request(target["id"], name)
-                            self.db.watcher_state(target["id"], name, "running", "Started")
-                            LOG.info("watcher=%s target=%s state=started", name, target["name"])
-                            success = await getattr(self.watchers, name)(target)
+                        async with (self.bruteforce_lock if name == "dns_bruteforce" else nullcontext()):
+                            async with self.scans.slot(exclusive=name == "dns_bruteforce"):
+                                self.db.consume_run_request(target["id"], name)
+                                self.db.watcher_state(target["id"], name, "running", "Started")
+                                LOG.info("watcher=%s target=%s state=started", name, target["name"])
+                                success = await getattr(self.watchers, name)(target)
                     except asyncio.CancelledError:
                         self.db.watcher_state(target["id"], name, "interrupted", "Daemon stopped; run will be retried")
                         self.db.request_run(target["id"], name)
@@ -128,7 +131,11 @@ class Scheduler:
             except Exception as error:
                 LOG.error("watcher=monitoring error=%s", error)
                 self.db.set_runtime("delivery", {"state": "failed", "error": type(error).__name__, "checked_at": time.time()})
-            await asyncio.sleep(self.config["intervals"]["monitoring"])
+            try:
+                await asyncio.wait_for(self.notify_wake.wait(), timeout=self.config["intervals"]["monitoring"])
+                self.notify_wake.clear()
+            except TimeoutError:
+                pass
 
     async def heartbeat(self):
         while True:

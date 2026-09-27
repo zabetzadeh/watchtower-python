@@ -38,6 +38,10 @@ class Watchers:
         return new
 
     async def passive_discovery(self, target):
+        if not target["domains"]:
+            self.db.watcher_state(target["id"], "passive_discovery", "skipped", "No domains configured for this target")
+            LOG.info("target=%s watcher=passive_discovery state=skipped reason=no_domains", target["name"])
+            return True
         success = True
         for domain in target["domains"]:
             for source in ("subfinder", "chaos", "crtsh"):
@@ -153,6 +157,10 @@ class Watchers:
             self.db.watcher_state(target["id"], "dns_bruteforce", "skipped", "Static and dynamic modes are disabled")
             LOG.info("target=%s watcher=dns_bruteforce state=skipped reason=both_modes_disabled", target["name"])
             return True
+        if not target["domains"]:
+            self.db.watcher_state(target["id"], "dns_bruteforce", "skipped", "No domains configured for this target")
+            LOG.info("target=%s watcher=dns_bruteforce state=skipped reason=no_domains", target["name"])
+            return True
         LOG.info("target=%s watcher=dns_bruteforce static_enabled=%s dynamic_enabled=%s threads=%s",
                  target["name"], settings["static"]["enabled"], settings["dynamic"]["enabled"],
                  settings["shuffledns"]["threads"])
@@ -169,20 +177,43 @@ class Watchers:
                 success = False
                 self.error(target, "dns_bruteforce", f"No nonempty .txt wordlists in {directory}")
                 LOG.warning("target=%s watcher=dns_bruteforce no_wordlists=%s", target["name"], directory)
+            chunk_size = settings["static"].get("chunk_size", 5000)
+            cooldown = settings["shuffledns"].get("cooldown", 1.0)
             for domain in target["domains"]:
                 for number, wordlist in enumerate(wordlists, 1):
                     LOG.info("target=%s domain=%s mode=static wordlist=%s wordlist_number=%s wordlists=%s state=started",
-                             target["name"], domain, wordlist, number, len(wordlists))
+                             target["name"], domain, wordlist.name, number, len(wordlists))
                     try:
-                        self.db.watcher_progress(target["id"], "dns_bruteforce", f"Static: {domain}, wordlist {number}/{len(wordlists)}: {wordlist.name}")
-                        async with self.tools.shuffledns(domain, wordlist=wordlist) as names:
-                            new = await self.ingest(target, names, "dns_bruteforce")
-                        LOG.info("target=%s domain=%s mode=static wordlist=%s state=finished new_asset_events=%s",
-                                 target["name"], domain, wordlist, new)
+                        with wordlist.open("r", encoding="utf-8", errors="replace") as stream:
+                            chunks = []
+                            current = []
+                            for line in stream:
+                                word = line.strip()
+                                if word and not word.startswith("#"):
+                                    current.append(word)
+                                    if len(current) >= chunk_size:
+                                        chunks.append(current)
+                                        current = []
+                            if current:
+                                chunks.append(current)
+                        total_chunks = len(chunks) or 1
+                        with tempfile.TemporaryDirectory(prefix="assetwatch-brute-chunk-") as tmpdir:
+                            chunk_file = Path(tmpdir) / "chunk.txt"
+                            for chunk_num, words in enumerate(chunks, 1):
+                                chunk_file.write_text("\n".join(words) + "\n", encoding="utf-8")
+                                self.db.watcher_progress(
+                                    target["id"], "dns_bruteforce",
+                                    f"Static: {domain}, wordlist {number}/{len(wordlists)} ({wordlist.name}) chunk {chunk_num}/{total_chunks} ({len(words)} words)")
+                                async with self.tools.shuffledns(domain, wordlist=chunk_file) as names:
+                                    new = await self.ingest(target, names, "dns_bruteforce")
+                                LOG.info("target=%s domain=%s mode=static wordlist=%s chunk=%s/%s words=%s state=finished new_asset_events=%s",
+                                         target["name"], domain, wordlist.name, chunk_num, total_chunks, len(words), new)
+                                if chunk_num < total_chunks and cooldown > 0:
+                                    await asyncio.sleep(cooldown)
                     except Exception as error:
                         success = False
                         self.error(target, "dns_bruteforce", error)
-                        LOG.error("target=%s domain=%s wordlist=%s error=%s", target["name"], domain, wordlist, error)
+                        LOG.error("target=%s domain=%s wordlist=%s error=%s", target["name"], domain, wordlist.name, error)
         if settings["dynamic"]["enabled"]:
             try:
                 await self.dynamic_bruteforce(target)

@@ -365,6 +365,108 @@ class AsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
         row = self.db.connection.execute("SELECT * FROM watcher_status").fetchone()
         self.assertEqual(row["state"], "interrupted")
 
+    async def test_bot_all_button_commands_and_plain_text(self):
+        # Ingest assets with various sources and states
+        self.db.ingest(self.target["id"], ["live.example.test"], "dns_bruteforce")
+        self.db.ingest(self.target["id"], ["passive.example.test"], "subfinder")
+        self.db.ingest(self.target["id"], ["ptr.example.test"], "ptr")
+        for asset in list(self.db.assets()):
+            if asset["hostname"] == "live.example.test":
+                self.db.observe_dns(asset["id"], ["192.0.2.1"])
+                refreshed = [a for a in self.db.assets() if a["id"] == asset["id"]][0]
+                self.db.observe_http(asset["id"], {"status_code": 200, "url": "https://live.example.test"}, refreshed["dns_version"])
+            elif asset["hostname"] == "passive.example.test":
+                self.db.observe_dns(asset["id"], ["192.0.2.2"])
+            self.db.observe_cnames(asset["id"], ["alias.vendor.test"])
+
+        bot = Bot(self.config, self.db)
+        # Test plain button labels
+        self.assertIn("CNAME:", bot.response("CNAME's"))
+        self.assertIn("live.example.test", bot.response("Live's"))
+        self.assertIn("live.example.test", bot.response("Resolved"))
+        self.assertIn("live.example.test", bot.response("Brute force result"))
+        self.assertIn("passive.example.test", bot.response("Passive"))
+        self.assertIn("ptr.example.test", bot.response("PTR's"))
+        self.assertIn("Assetwatch", bot.response("Help"))
+        self.assertIn("example.test", bot.response("Targets"))
+        self.assertIn("Daemon:", bot.response("Health"))
+        self.assertIn("fresh_asset", bot.response("Changes"))
+        self.assertIn("fresh_asset", bot.response("New"))
+
+        # Test prompt responses for action buttons without args
+        self.assertIn("➕ Add Target", bot.response("Add target"))
+        self.assertIn("🔄 Update Target", bot.response("Update target"))
+        self.assertIn("🗑️ Remove Target", bot.response("Remove target"))
+
+    async def test_bot_target_management_add_update_remove(self):
+        bot = Bot(self.config, self.db)
+        # Add target with domain and CIDR
+        res = bot.response("/add_target testcorp corp.test 10.0.0.0/24")
+        self.assertIn("Target Added: testcorp", res)
+        self.assertIn("corp.test", res)
+        self.assertIn("10.0.0.0/24", res)
+
+        # Add target with CIDR only
+        res = bot.response("/add_target cidronly 192.168.1.0/24")
+        self.assertIn("Target Added: cidronly", res)
+        self.assertIn("192.168.1.0/24", res)
+
+        # Update target
+        res = bot.response("/update_target testcorp extra.test 10.1.0.0/24")
+        self.assertIn("Target Updated: testcorp", res)
+        self.assertIn("extra.test", res)
+        self.assertIn("10.1.0.0/24", res)
+
+        # Remove target
+        res = bot.response("/remove_target testcorp")
+        self.assertIn("Target Removed: testcorp", res)
+        with self.assertRaises(ValueError):
+            self.db.target("testcorp")
+
+    async def test_bot_poll_handles_plain_button_text(self):
+        self.config["telegram"].update(chat_id="123", bot_token="fixture-secret", send_delay=0.001)
+        bot = Bot(self.config, self.db)
+        updates = [{"update_id": 1, "message": {"chat": {"id": 123}, "text": "Live's"}},
+                   {"update_id": 2, "message": {"chat": {"id": 123}, "text": "CNAME's"}},
+                   {"update_id": 3, "message": {"chat": {"id": 123}, "text": "Brute force result"}}]
+        calls = []
+
+        async def api(method, payload):
+            calls.append((method, payload))
+            return updates if method == "getUpdates" else {"message_id": 1}
+
+        with patch.object(bot, "api", api):
+            await bot.poll()
+        sends = [payload for method, payload in calls if method == "sendMessage"]
+        self.assertEqual(len(sends), 3)
+        self.assertTrue(all(p["reply_markup"]["keyboard"] for p in sends))
+
+    async def test_automatic_notification_wake_on_event(self):
+        self.config["telegram"].update(enabled=True, chat_id="123", bot_token="fixture-secret")
+        notified = []
+
+        class DummyNotifier:
+            async def flush(self):
+                notified.append(time.time())
+                return False
+
+        scheduler = Scheduler(self.config, self.db, notifier=DummyNotifier())
+        self.assertEqual(len(notified), 0)
+
+        # Ingesting a new asset triggers _event("fresh_asset"), which triggers db.on_event -> notify_wake.set()
+        task = asyncio.create_task(scheduler.monitoring())
+        try:
+            await asyncio.sleep(0.02)
+            self.assertGreaterEqual(len(notified), 1)
+            count = len(notified)
+            # Ingest asset - should instantly wake up monitoring task
+            self.db.ingest(self.target["id"], ["instant.example.test"], "subfinder")
+            await asyncio.sleep(0.05)
+            self.assertGreater(len(notified), count)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
 
 if __name__ == "__main__":
     unittest.main()
