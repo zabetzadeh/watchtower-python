@@ -1,5 +1,14 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
+
+
+def redact(config, message):
+    for secret in (config["telegram"]["bot_token"], config["chaos"]["api_key"],
+                   os.environ.get("PDCP_API_KEY"), os.environ.get("CHAOS_KEY")):
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    return message
 
 
 class SecretFilter(logging.Filter):

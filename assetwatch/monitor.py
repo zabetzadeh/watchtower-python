@@ -6,7 +6,9 @@ def dns_events(previous: dict, addresses: list[str]) -> list[str]:
         return ["fresh_subdomain"]
     if not addresses and previous["dns_resolved"]:
         return ["dns_unresolved"]
-    if addresses != previous["ip_addresses"]:
+    # Round-robin DNS can return different subsets of an established address pool.
+    # Keep current observations separately; alert only on previously unseen IPs.
+    if set(addresses) - set(previous.get("known_ip_addresses", previous["ip_addresses"])):
         return ["dns_ip_changed"]
     return []
 

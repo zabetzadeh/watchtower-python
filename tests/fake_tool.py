@@ -33,7 +33,15 @@ elif name == "tlsx":
     print(json.dumps({"ip": "192.0.2.1", "subject_cn": "cert.example.test", "subject_an": ["*.cert.example.test", "outside.invalid"]}))
     print(json.dumps({"ip": "198.51.100.1", "subject_cn": "wrong-cidr.example.test"}))
 elif name == "dnsx":
+    if "-ptr" in args:
+        print(" PTR.Example.Test. ")
+        print("ptr.example.test")
+        print("outside.invalid")
+        sys.exit(0)
     for host in hosts:
+        if "-cname" in args:
+            print(json.dumps({"host": host, "status_code": "NOERROR", "cname": ["service.vendor.test"] if phase == 4 else []}))
+            continue
         if host.startswith("unresolved.") or phase == 3:
             print(json.dumps({"host": host, "status_code": "NXDOMAIN"}))
         else:

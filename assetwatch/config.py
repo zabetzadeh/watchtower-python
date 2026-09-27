@@ -10,14 +10,22 @@ from urllib.parse import urlsplit
 
 import yaml
 
+WATCHERS = ("passive_discovery", "tlsx", "dns_resolution", "http_probe", "dns_bruteforce", "ptr_discovery")
+PROGRAM_FEEDS = {
+    platform: f"https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/{platform}_data.json"
+    for platform in ("hackerone", "bugcrowd", "intigriti")
+}
+
 DEFAULTS = {
     "database": {"path": "./data/assets.db"},
     "intervals": {"passive_discovery": 3600, "tlsx": 3600,
                   "dns_resolution": 1800, "http_probe": 1800,
-                  "monitoring": 300, "dns_bruteforce": 604800},
+                  "monitoring": 300, "dns_bruteforce": 604800, "ptr_discovery": 3600,
+                  "program_watch": 3600},
+    "program_watch": {"enabled": True, "max_feed_bytes": 32 * 1024 * 1024},
     "runtime": {"batch_size": 500, "tool_timeout": 1800,
                 "request_timeout": 30, "threads": 10, "poll_interval": 1,
-                "progress_interval": 30},
+                "progress_interval": 30, "failure_retry_interval": 300},
     "chaos": {"api_key": ""},
     "cdn": {"enabled": True, "refresh_interval": 86400, "retry_interval": 3600,
             "max_age": 604800,
@@ -27,7 +35,8 @@ DEFAULTS = {
                        "dynamic": {"enabled": True, "batch_size": 100},
                        "shuffledns": {"threads": 10, "resolvers": "./resolvers.txt"}},
     "telegram": {"enabled": False, "bot_token": "", "chat_id": "",
-                 "batch_size": 50, "send_delay": 1.1, "notify_dns_ip_changes": True},
+                 "batch_size": 50, "send_delay": 1.1, "notify_dns_ip_changes": True,
+                 "commands_enabled": True, "command_poll_interval": 3},
     "logging": {"file": "./logs/assetwatch.log", "level": "INFO",
                 "max_bytes": 10485760, "backup_count": 5},
     "tools": {name: name for name in
@@ -91,12 +100,16 @@ def load_config(filename: str | Path = "config.yaml") -> Config:
         positive(value, f"intervals.{name}")
     for name, value in values["runtime"].items():
         positive(value, f"runtime.{name}", name in {"batch_size", "threads"})
-    for section in (values["telegram"], values["cdn"], values["dns_bruteforce"]["static"],
+    for section in (values["telegram"], values["cdn"], values["program_watch"], values["dns_bruteforce"]["static"],
                     values["dns_bruteforce"]["dynamic"]):
         if not isinstance(section["enabled"], bool):
             raise ValueError("enabled values must be YAML true or false")
+    positive(values["program_watch"]["max_feed_bytes"], "program_watch.max_feed_bytes", True)
     if not isinstance(values["telegram"]["notify_dns_ip_changes"], bool):
         raise ValueError("telegram.notify_dns_ip_changes must be YAML true or false")
+    if not isinstance(values["telegram"]["commands_enabled"], bool):
+        raise ValueError("telegram.commands_enabled must be YAML true or false")
+    positive(values["telegram"]["command_poll_interval"], "telegram.command_poll_interval")
     for key in ("refresh_interval", "retry_interval", "max_age"):
         positive(values["cdn"][key], f"cdn.{key}")
     if values["cdn"]["max_age"] < values["cdn"]["refresh_interval"]:

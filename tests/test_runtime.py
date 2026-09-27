@@ -20,7 +20,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(signal=sig), tempfile.TemporaryDirectory() as directory:
                 directory = Path(directory)
                 config = directory / "config.yaml"
-                config.write_text(yaml.safe_dump({"runtime": {"poll_interval": 0.01}}))
+                config.write_text(yaml.safe_dump({"runtime": {"poll_interval": 0.01}, "program_watch": {"enabled": False}}))
                 command = [sys.executable, "-m", "assetwatch", "--config", str(config)]
                 process = await asyncio.create_subprocess_exec(*command, "run", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 try:

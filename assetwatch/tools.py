@@ -199,10 +199,17 @@ class Tools:
                 yield names()
 
     async def dns(self, hostnames: list[str]) -> dict[str, list[str]]:
+        return await self.dns_records(hostnames, "a")
+
+    async def cnames(self, hostnames: list[str]) -> dict[str, list[str]]:
+        # Separate requests keep A errors independent from CNAME observations.
+        return await self.dns_records(hostnames, "cname")
+
+    async def dns_records(self, hostnames: list[str], record: str) -> dict[str, list[str]]:
         with tempfile.TemporaryDirectory(prefix="assetwatch-dns-") as directory:
             inputs = Path(directory) / "hosts.txt"
             inputs.write_text("\n".join(hostnames) + "\n", encoding="utf-8")
-            args = ["-a", "-json", "-silent", "-duc", "-rcode", "noerror,nxdomain,servfail,refused",
+            args = ["-" + record, "-json", "-silent", "-duc", "-rcode", "noerror,nxdomain,servfail,refused",
                     "-t", str(self.config["runtime"]["threads"])]
             async with self.runner.run("dnsx", args, inputs) as path:
                 results, requested = {}, set(hostnames)
@@ -216,14 +223,32 @@ class Tools:
                         continue
                     if status not in {"NOERROR", "NXDOMAIN"}:
                         raise ToolError("dnsx: result has a missing or unsupported status_code")
-                    addresses = row.get("a", [])
-                    if not isinstance(addresses, list):
-                        raise ToolError("dnsx: invalid A record list")
-                    results[host] = ipv4_addresses(addresses) if status == "NOERROR" else []
+                    values = row.get(record, [])
+                    if not isinstance(values, list):
+                        raise ToolError(f"dnsx: invalid {record} record list")
+                    if record == "a":
+                        values = ipv4_addresses(values) if status == "NOERROR" else []
+                    else:
+                        normalized = [normalize_hostname(value) for value in values]
+                        if not all(normalized):
+                            raise ToolError("dnsx: invalid CNAME hostname")
+                        values = normalized
+                    # Some versions/resolvers return multiple rows for one host.
+                    results[host] = sorted(set(results.get(host, [])) | set(values))
                 # Missing responses are inconclusive (timeouts), never evidence of DNS loss.
                 if requested - results.keys():
                     LOG.warning("tool=dnsx inconclusive=%s state_preserved=true", len(requested - results.keys()))
                 return results
+
+    @asynccontextmanager
+    async def ptr(self, addresses: list[str]):
+        with tempfile.TemporaryDirectory(prefix="assetwatch-ptr-") as directory:
+            inputs = Path(directory) / "addresses.txt"
+            inputs.write_text("\n".join(sorted(set(addresses))) + "\n", encoding="utf-8")
+            args = ["-ptr", "-resp-only", "-silent", "-duc", "-stream",
+                    "-t", str(self.config["runtime"]["threads"])]
+            async with self.runner.run("dnsx", args, inputs, context="record=ptr") as path:
+                yield text_lines(path)
 
     async def http(self, hostnames: list[str]) -> dict[str, dict | None]:
         with tempfile.TemporaryDirectory(prefix="assetwatch-http-") as directory:

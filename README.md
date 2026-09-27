@@ -81,13 +81,13 @@ Use `assetwatch --config /path/to/config.yaml ...` for another configuration.
 Relative database, log, executable and wordlist paths follow the YAML file's
 directory. Bare executable names are resolved through PATH.
 
-Five independent asynchronous tasks run passive discovery, TLSX, DNSX, HTTPX and
-DNS brute force. A sixth polls notifications at `intervals.monitoring`, draining
+Six independent asynchronous tasks run passive discovery, TLSX, DNSX (A and CNAME),
+HTTPX, DNS brute force and PTR discovery. Another task polls notifications at `intervals.monitoring`, draining
 full successful batches without waiting for another interval; state
 comparison happens immediately when observations are committed. Each task processes
 targets sequentially. Tools have bounded concurrency and a configurable overall
 timeout. Brute force has exclusive access to scan resources: it waits for active
-passive/TLSX/DNSX/HTTPX jobs to finish, then runs DNSGen and ShuffleDNS/MassDNS
+passive/TLSX/DNSX/HTTPX/PTR jobs to finish, then runs DNSGen and ShuffleDNS/MassDNS
 sequentially while other scan jobs wait. This applies across all targets. Queued
 jobs resume afterward; their intervals still run from completion. Telegram delivery
 and CLI inspection remain available. Subfinder, Chaos and crt.sh run each passive
@@ -99,15 +99,27 @@ URL. `doctor` checks that the installed executables support both required flags.
 
 Intervals are seconds **after the previous run finishes**, persisted per target
 and watcher across restarts. Newly added targets are picked up without restarting.
-Failed runs retry on their normal interval. For a failed weekly brute-force run,
-fix the issue and temporarily lower `intervals.dns_bruteforce` before restarting
-if you need an earlier retry. Configuration changes require a restart.
+Failed or partially inconclusive runs retry after the smaller of their normal interval
+and `runtime.failure_retry_interval` (default 300 seconds). This also applies to
+previously failed runs stored before upgrading, so a missing resolver file no longer
+postpones another attempt for a week. Interrupted runs are retried on restart.
+Use `assetwatch rerun dns_bruteforce --target example` to queue a run immediately;
+it still waits for scan access and requires the daemon to be running. Repeated
+requests deduplicate; a request made during a run schedules one additional run.
+Configuration changes require a restart.
 
 All discovery sources normalize and insert into the same asset table. Root domains
 are seeded on target creation. Every known hostname remains eligible for periodic
 DNS checks, including unresolved and months-old assets. HTTPX checks only hosts
 with a usable IPv4 A record. Certificate names must belong to a configured domain
 of the target whose CIDR produced them; shared-certificate neighbors are discarded.
+TLSX requires configured CIDRs; targets without them show `skipped` with a reason.
+PTR discovery runs every `intervals.ptr_discovery` (default 3600 seconds), using
+`dnsx -ptr -resp-only` on each target's configured CIDRs and distinct currently
+observed A-record IPs. CIDR expansion is streamed by dnsx, with bounded tool threads
+and the usual tool timeout. PTR names outside the target's root domains are discarded.
+Accepted names use source `ptr` and automatically receive the same DNS/HTTP monitoring.
+[DNSX documents the PTR, CNAME and response-only flags here](https://docs.projectdiscovery.io/opensource/dnsx/usage).
 Dynamic DNSGen processes only hostnames added since its last successful seed batch,
 including unresolved findings from every source. Generated candidates are normalized,
 scope-filtered, deduplicated and appended to a per-target cache in the same SQLite
@@ -146,6 +158,98 @@ sidecar holds the daemon's OS lock; do not remove it while the daemon runs. SQLi
 WAL sidecars are part of the same database. Keep the database on a local
 filesystem. Back up using SQLite's backup API, or stop the daemon before copying.
 
+## Bug bounty program scope watch
+
+`assetwatch run` also watches the public program feeds from bounty-targets-data:
+
+* [HackerOne](https://github.com/arkadiyt/bounty-targets-data/blob/main/data/hackerone_data.json)
+* [Bugcrowd](https://github.com/arkadiyt/bounty-targets-data/blob/main/data/bugcrowd_data.json)
+* [Intigriti](https://github.com/arkadiyt/bounty-targets-data/blob/main/data/intigriti_data.json)
+
+The watcher downloads the raw JSON versions of those files. It is enabled by default
+and runs once per hour, independently for each feed, even with no configured scan
+targets or while brute force holds scan access. Set these values in your YAML to
+change its interval or disable it:
+
+```yaml
+program_watch:
+  enabled: true
+  max_feed_bytes: 33554432  # Maximum download size per feed (32 MiB)
+intervals:
+  program_watch: 3600      # Seconds after each source's completed check
+```
+
+**The first successful fetch of each platform establishes a silent baseline.**
+Subsequent checks generate exactly two kinds of events:
+
+* `new_program`: a program identity not seen before on that platform, with its
+  initial in-scope entries in the same alert.
+* `scope_added`: newly seen in-scope entries for an existing program. The alert
+  contains only the added entries.
+
+Program removals, removed scope entries, out-of-scope changes, policy/description
+edits, bounty amount changes, display-name changes and asset-type-only edits do not alert.
+Previously seen programs/scopes stay remembered, so removal followed by reappearance
+does not alert again. A scope entry moving from out-of-scope to in-scope alerts if
+it has not previously been seen in-scope. Scope comparison preserves URL path case
+and distinguishes wildcard scope from a bare domain.
+
+All asset categories in the feeds are supported: domains, URLs, CIDRs, apps, source
+code, hardware and other entries. Programs without monetary rewards are included
+when present in these feeds. Only the feeds' structured `targets.in_scope` entries
+are compared; policy prose is not interpreted as additional scope. Review the linked
+program's current policy when deciding what to test. Feed changes never create
+scan targets or put third-party assets into DNS/HTTP/brute-force monitoring.
+
+The program catalog, ever-seen scope, source baselines, events and Telegram delivery
+progress all use the existing SQLite database. Identity uses the HackerOne handle,
+Bugcrowd program URL and Intigriti ID, qualified by platform. The HackerOne export's
+numeric ID is not used because it can be zero for every program. Empty, malformed
+or failed downloads preserve the last baseline and retry after
+`runtime.failure_retry_interval` (capped by the normal interval). Each source fails
+independently. Downloads use `runtime.request_timeout`; the configured size limit
+prevents unbounded feed reads. Restarting preserves baselines and schedules.
+
+Alerts use Telegram [MarkdownV2](https://core.telegram.org/bots/api#markdownv2-style)
+with a bold title/program name, platform, added-entry count, code-formatted scope,
+UTC timestamp, event reference and an **Open program ↗** button. Dynamic text is
+escaped so wildcards, underscores and other feed content cannot break formatting.
+Large changes are split into numbered messages without dropping entries. Each part
+is acknowledged separately in SQLite; retries resume with the undelivered parts.
+Program and asset notifications alternate so an existing asset backlog does not
+hide new program additions. Telegram settings and delivery retries are shared.
+
+Example of a scope-addition alert as it appears in Telegram:
+
+> 🎯 **Scope Expanded**
+>
+> **Example Program**
+> Platform: **HackerOne**
+> New in-scope entries: **2**
+>
+> • `*.new.example.com` _wildcard_
+> • `https://api.example.com/v2` _url_
+>
+> 🕒 `2026-09-27 10:30 UTC`
+> Event: `P42` • Part 1/1
+>
+> **Open program ↗**
+
+Inspect feed health, errors, schedules and history with:
+
+```sh
+assetwatch health
+assetwatch logs --module program_watch --lines 100
+assetwatch program-changes
+assetwatch program-changes --platform hackerone --limit 20 --offset 0 --format json
+```
+
+In Telegram, `/programs` shows recent additions across all platforms, and
+`/programs bugcrowd 2` shows the second page for Bugcrowd. History summaries preview
+up to five scope entries; alerts and CLI JSON retain every added entry. `/health`
+shows each feed's baseline/check status, counts, last error and next check.
+If Telegram is disabled, additions are still recorded and queued for later delivery.
+
 ## Inspect and export
 
 ```sh
@@ -156,11 +260,25 @@ assetwatch assets --all --unresolved
 assetwatch assets --all --no-http --format json
 assetwatch domains --target example
 assetwatch domains --all --format json
+assetwatch domains --target example --source ptr
+assetwatch assets --target example --source dns_bruteforce
+assetwatch assets --target example --source tlsx
+assetwatch cnames --target example --limit 100 --offset 0
+assetwatch changes --target example --type dns_cname_changed
+assetwatch changes --target example --type fresh_asset
+assetwatch health --target example
+assetwatch health --format json
+assetwatch logs --module dns_bruteforce --lines 100
+assetwatch logs --module tlsx --lines 100
+assetwatch rerun dns_bruteforce --target example
 assetwatch target remove example --yes
 ```
 
 Text asset output is tab-separated. JSON includes sources, timestamps, current and
-previous status, availability history and HTTP metadata. `PENDING` means no
+previous status, availability history and HTTP metadata. `ip_addresses` contains
+the latest complete observed A-record set; `known_ip_addresses` contains all IPs
+ever observed for that asset. `cname_records` holds all returned CNAME names, and
+`cname_checked_at` distinguishes an empty observation from no observation yet. `PENDING` means no
 conclusive observation yet; `--unresolved`/`--no-http` also include pending assets.
 Raw domain output has no headers or duplicates, even across explicitly overlapping
 targets. A target removal deletes its assets, events and notification history.
@@ -169,14 +287,21 @@ the same domain under two targets gives each its own independent state.
 
 ## State and notifications
 
-Events: `fresh_asset`, `fresh_subdomain`, `dns_unresolved`, `dns_ip_changed`,
+Events: `fresh_asset`, `fresh_subdomain`, `dns_unresolved`, `dns_ip_changed`, `dns_cname_changed`,
 `http_service_appeared`, `http_service_disappeared`, `http_service_returned`, and
-`http_status_changed`. Fresh-asset messages identify certificate/brute-force sources.
+`http_status_changed`. Fresh-asset messages identify certificate/brute-force/PTR sources.
 Unchanged observations generate no new event. A later repeat of a real transition
 (200 → 403 → 200 → 403) creates a new event for each occurrence.
 
-IP changes are kept in SQLite and **notify by default, except known CDN address
-rotation**. The filter compares the old and new IP sets against downloaded provider
+A-record observations are normalized, deduplicated and compared as sets; multiple
+DNSX rows for the same hostname are merged. The database remembers all previously
+seen IPs per asset across restarts. **A newly seen IP can notify; rotation among
+known IPs, response reordering, and a nonempty subset of a known pool do not.**
+Removing only part of a pool updates current state without an IP alert; a completely
+empty conclusive A response still generates the normal DNS-loss event. Historical
+IPs are never used to authorize an HTTP probe when the current A set is empty.
+
+New-IP events **notify by default, except known CDN address rotation**. The filter compares the old and new IP sets against downloaded provider
 CIDRs. It skips an alert only when every added/removed address is a known CDN IP
 and the set of providers stays the same. An unchanged origin IP alongside rotating
 CDN IPs is fine; an origin IP change, unknown IP, provider migration, or move onto/off
@@ -206,9 +331,25 @@ macOS workspace, the existing system bundle works with
 Suppressed events retain their full state history and a durable suppression reason;
 they are logged as `telegram=suppressed` and are never marked as delivered. They do
 not re-enter the queue after restart. Set `cdn.enabled: false` to notify on all future
-IP changes, or `telegram.notify_dns_ip_changes: false` to mute all IP-only alerts.
+new-IP events, or `telegram.notify_dns_ip_changes: false` to mute all IP-only alerts.
 If upgrading from the previous global mute, set `notify_dns_ip_changes: true` in
 your existing YAML: its undelivered backlog will then pass through the CDN filter.
+
+CNAME monitoring covers every asset, including unresolved hosts. It makes a separate
+DNSX CNAME request so an A-record failure cannot erase valid CNAME state. External
+alias destinations are stored as record data, without adding them to scan scope.
+The first conclusive CNAME observation establishes a silent baseline. Later
+additions, removals and replacements generate `dns_cname_changed` events with both
+old and new sets, independent of IP/CDN notification filtering. Identical normalized
+sets stay quiet. These alerts are investigation signals, not proof of a takeover;
+no takeover probing or exploitation is performed. `cnames` and `/cnames` list current
+records; `changes --type dns_cname_changed` provides their history.
+
+Existing databases are migrated automatically without removing assets or history.
+The migration seeds known IP pools from current state and historical event snapshots,
+and suppresses undelivered historical `dns_ip_changed` events that merely revisited
+IPs already seen at that point (`known_ip_rotation`). Truly new-IP events remain
+queued. Back up and stop the old daemon before upgrading, then restart the new code.
 
 DNSX uses explicit NOERROR/NXDOMAIN observations. SERVFAIL, REFUSED, omitted results,
 failed executables, timeouts and malformed output preserve previous state. HTTPX
@@ -218,7 +359,8 @@ from an HTTP batch are discarded if its DNS state or IP set changed in flight.
 HTTPX uses its default HTTPS-first/HTTP-fallback behavior, does not follow redirects,
 and records one representative HTTP service per hostname (not every port/scheme).
 
-Telegram is disabled initially. To enable it:
+Telegram is disabled initially. The supplied config reads credentials from environment
+variables; no literal bot credentials are needed in YAML. To enable it:
 
 ```sh
 export TELEGRAM_BOT_TOKEN='your-token'
@@ -233,8 +375,11 @@ intervals:
   monitoring: 30          # Telegram polling only; separate from DNS/HTTP scans
 runtime:
   progress_interval: 30   # Seconds between running-tool heartbeats
+  failure_retry_interval: 300
 telegram:
   notify_dns_ip_changes: true
+  commands_enabled: true
+  command_poll_interval: 3
 cdn:
   enabled: true
   refresh_interval: 86400
@@ -252,6 +397,57 @@ The outbox interval controls how soon new events are picked up: 12000 means up t
 3 hours 20 minutes even before any delivery backlog. Existing eligible backlogs
 now drain continuously in bounded batches, respecting `telegram.send_delay` and
 server retry delays.
+
+### Bot menu and module diagnostics
+
+With the daemon running and Telegram enabled, send `/start` or `/help` to the bot.
+It replies with a button menu and these read-only commands:
+
+| Command | What it shows |
+| --- | --- |
+| `/health [target] [page]` | Module state, start/finish/next times, last error, result and new-asset counts, missing prerequisites, daemon heartbeat, delivery backlog |
+| `/changes [target] [page]` | Latest persisted discovery, DNS, CNAME and HTTP changes |
+| `/new [target] [page]` | Newly discovered assets and their source |
+| `/cnames [target] [page]` | Current CNAME records, including aliases on unresolved hosts |
+| `/targets [page]` | Target names, domains and CIDRs |
+| `/programs [platform] [page]` | New bounty programs and added scope from HackerOne, Bugcrowd and Intigriti |
+
+`/status` aliases `/health`; `/updates` aliases `/changes`. Omit a target or use `*`
+for all targets. Quote target names containing spaces, for example
+`/changes "Example Company" 2`. Follow the next-page command to inspect all results.
+Commands only reply to the numeric chat ID in `telegram.chat_id`; other chats are
+ignored. Everyone in that configured group can read the reports. No target changes
+or scans can be initiated through the bot. Set `telegram.commands_enabled: false`
+to keep notifications only. Updates use persisted offsets, independent of notification
+backlogs and scan locks. Telegram's `getUpdates` requires that the bot has no active
+webhook or other polling consumer; failures appear in terminal/CLI health reports.
+
+`assetwatch health` works even while the daemon is stopped. It distinguishes
+`never_run`, `queued`, `running`, `success`, `failed`, `skipped` and interrupted/stale
+work. A heartbeat confirms whether the daemon is active; saved successful runs are
+historical information, not a claim that the daemon is still running. `results` counts
+raw discovered names (before scope filtering/deduplication) for discovery modules,
+and conclusive observations for DNS/HTTP; `new_assets` counts actual inserted assets.
+Progress updates identify the current wordlist, DNSGen seed batch or candidate count.
+Failed runs can have partial results. Health checks local prerequisites without
+making network requests; `doctor` also checks executable help/flag compatibility.
+
+For brute-force or TLSX troubleshooting:
+
+1. Run `assetwatch health --target example` and `assetwatch doctor`.
+2. Supply nonempty static `.txt` wordlists, a nonempty resolver file, and the configured
+   executables. Missing resolvers now fail before expensive DNSGen generation.
+   TLSX skips targets with no CIDRs; inspect their scope with `target show`.
+3. Read `assetwatch logs --module dns_bruteforce --lines 100` or
+   `assetwatch logs --module tlsx --lines 100`. Logs show errors and running-tool
+   heartbeats. This reads the current configured log file; older logs remain in its
+   rotated siblings. Add `--target example` for target-tagged entries (tool-only
+   heartbeat/stderr lines may have no target tag).
+4. After fixing inputs, queue `assetwatch rerun dns_bruteforce --target example`
+   or `assetwatch rerun tlsx --target example`. `queued` can mean another scan still
+   owns the scan resources; inspect the other modules in health.
+5. Inspect results with `assetwatch domains --target example --source dns_bruteforce`
+   or `--source tlsx`. A successful run can find zero new assets and send no alerts.
 
 State and its event commit atomically. Events queue while Telegram is disabled or
 unreachable and are delivered after it is enabled, including the existing backlog,

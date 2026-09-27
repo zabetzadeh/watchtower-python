@@ -196,9 +196,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch("assetwatch.tools.read_json", return_value=[{"name_value": "crt.example.test\nunresolved.example.test"}]):
             self.assertFalse(await self.watchers.passive_discovery(self.target))  # Chaos fails; other sources succeed.
         await self.watchers.tlsx(self.target)
+        await self.watchers.ptr_discovery(self.target)
         self.assertTrue(await self.watchers.dns_bruteforce(self.target))
         assets = {asset["hostname"]: asset for asset in self.db.assets()}
-        for name in ("api.example.test", "crt.example.test", "cert.example.test", "static.example.test", "generated.example.test", "generated.example.org"):
+        for name in ("api.example.test", "crt.example.test", "cert.example.test", "ptr.example.test", "static.example.test", "generated.example.test", "generated.example.org"):
             self.assertIn(name, assets)
         self.assertNotIn("outside.invalid", assets)
         self.assertNotIn("wrong-cidr.example.test", assets)
@@ -218,6 +219,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unresolved.example.test", dnsgen_input)
         self.assertIn("api.example.org", dnsgen_input)
         for record in records:
+            if record["tool"] == "dnsx" and "-ptr" in record["args"]:
+                self.assertIn("-resp-only", record["args"])
             if record["tool"] == "subfinder":
                 self.assertIn("-recursive", record["args"])
             if record["tool"] == "chaos":
@@ -237,7 +240,34 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         before = list(self.db.assets())
         with patch.object(self.watchers.tools, "dns", side_effect=ToolError("dnsx failed")):
             self.assertFalse(await self.watchers.dns_resolution(self.target))
-        self.assertEqual(list(self.db.assets()), before)
+        # Successful independent CNAME checks still advance their observation timestamp.
+        after = list(self.db.assets())
+        for asset in before + after:
+            asset.pop("cname_checked_at")
+        self.assertEqual(after, before)
+
+    async def test_cname_alerts_include_unresolved_assets_and_ignore_ip_notification_mute(self):
+        self.db.ingest(self.target["id"], ["unresolved.example.test"], "subfinder")
+        await self.watchers.dns_resolution(self.target)
+        for event in self.db.pending_events(100):
+            self.db.notification_result(event["id"])
+        self.config["telegram"].update(enabled=True, bot_token="fixture-token", chat_id="123",
+                                       send_delay=0.001, notify_dns_ip_changes=False)
+        self.phase.write_text("4")
+        await self.watchers.dns_resolution(self.target)
+        cname_events = self.db.recent_events(kind="dns_cname_changed")
+        self.assertEqual(len(cname_events), 3)
+        unresolved = next(a for a in self.db.assets() if a["hostname"] == "unresolved.example.test")
+        self.assertFalse(unresolved["dns_resolved"])
+        self.assertEqual(unresolved["cname_records"], ["service.vendor.test"])
+        notifier = Notifier(self.config, self.db)
+        with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
+            await notifier.flush()
+            self.assertEqual(send.call_count, 3)
+            self.assertTrue(all("DNS CNAME Changed" in call.args[2]["text"] for call in send.call_args_list))
+            await self.watchers.dns_resolution(self.target)
+            await notifier.flush()
+            self.assertEqual(send.call_count, 3)
 
     async def test_bruteforce_logs_progress_and_delivers_each_new_asset_once(self):
         for event in self.db.pending_events(100):

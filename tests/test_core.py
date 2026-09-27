@@ -316,6 +316,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_recurrence_failure_isolation_and_no_overlap(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Config(copy.deepcopy(DEFAULTS), Path(directory))
+            config["program_watch"]["enabled"] = False
             config["runtime"]["poll_interval"] = 0.005
             config.values["intervals"] = {name: 0.015 for name in config["intervals"]}
             db = Database(Path(directory) / "test.db")

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .monitor import dns_events, http_events
 from .normalization import in_scope, ipv4_addresses, normalize_hostname
+from .programs import format_program_messages
 
 LOG = logging.getLogger(__name__)
 SCHEMA = """
@@ -70,6 +71,57 @@ CREATE TABLE IF NOT EXISTS watcher_runs (
     watcher TEXT NOT NULL, finished_at REAL NOT NULL, success INTEGER NOT NULL,
     PRIMARY KEY(target_id, watcher)
 );
+CREATE TABLE IF NOT EXISTS watcher_status (
+    target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    watcher TEXT NOT NULL, state TEXT NOT NULL, queued_at REAL, started_at REAL,
+    finished_at REAL, detail TEXT NOT NULL DEFAULT '', last_error TEXT,
+    results INTEGER NOT NULL DEFAULT 0, new_assets INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(target_id, watcher)
+);
+CREATE TABLE IF NOT EXISTS run_requests (
+    target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    watcher TEXT NOT NULL, PRIMARY KEY(target_id, watcher)
+);
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS program_feeds (
+    platform TEXT PRIMARY KEY, initialized_at TEXT,
+    state TEXT NOT NULL DEFAULT 'never_run', started_at REAL, checked_at REAL,
+    next_run_at REAL NOT NULL DEFAULT 0, last_error TEXT,
+    program_count INTEGER NOT NULL DEFAULT 0, scope_count INTEGER NOT NULL DEFAULT 0,
+    new_programs INTEGER NOT NULL DEFAULT 0, new_scopes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS programs (
+    platform TEXT NOT NULL REFERENCES program_feeds(platform), program_key TEXT NOT NULL,
+    name TEXT NOT NULL, url TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+    PRIMARY KEY(platform, program_key)
+);
+CREATE TABLE IF NOT EXISTS program_scopes (
+    platform TEXT NOT NULL, program_key TEXT NOT NULL,
+    identifier TEXT NOT NULL, type TEXT NOT NULL,
+    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+    PRIMARY KEY(platform, program_key, identifier),
+    FOREIGN KEY(platform, program_key) REFERENCES programs(platform, program_key)
+);
+CREATE TABLE IF NOT EXISTS program_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL, program_key TEXT NOT NULL,
+    event_type TEXT NOT NULL, program_name TEXT NOT NULL, program_url TEXT NOT NULL,
+    added_scope TEXT NOT NULL, created_at TEXT NOT NULL,
+    FOREIGN KEY(platform, program_key) REFERENCES programs(platform, program_key)
+);
+CREATE TABLE IF NOT EXISTS program_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES program_events(id),
+    part INTEGER NOT NULL, text TEXT NOT NULL,
+    delivered_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, attempted_at TEXT,
+    next_attempt_at REAL NOT NULL DEFAULT 0, last_error TEXT, message_id TEXT,
+    UNIQUE(event_id, part)
+);
+CREATE INDEX IF NOT EXISTS idx_program_events_platform ON program_events(platform, id);
+CREATE INDEX IF NOT EXISTS idx_program_messages_pending ON program_messages(next_attempt_at, id)
+    WHERE delivered_at IS NULL;
 CREATE TABLE IF NOT EXISTS dnsgen_progress (
     target_id INTEGER PRIMARY KEY REFERENCES targets(id) ON DELETE CASCADE,
     last_asset_id INTEGER NOT NULL
@@ -98,7 +150,7 @@ def utcnow() -> str:
 
 def decode_asset(row) -> dict:
     result = dict(row)
-    for field in ("ip_addresses", "http_metadata"):
+    for field in ("ip_addresses", "known_ip_addresses", "cname_records", "http_metadata"):
         result[field] = json.loads(result[field])
     for field in ("dns_resolved", "http_available", "http_ever_available"):
         result[field] = bool(result[field])
@@ -115,6 +167,33 @@ class Database:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=10000")
         self.connection.executescript(SCHEMA)
+        self.migrate()
+
+    def migrate(self):
+        # Additive migration, serialized with other CLI/daemon connections.
+        with self.transaction():
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(assets)")}
+            for name, definition in (("known_ip_addresses", "TEXT NOT NULL DEFAULT '[]'"),
+                                     ("cname_records", "TEXT NOT NULL DEFAULT '[]'"),
+                                     ("cname_checked_at", "TEXT")):
+                if name not in columns:
+                    self.connection.execute(f"ALTER TABLE assets ADD COLUMN {name} {definition}")
+            if "known_ip_addresses" not in columns:
+                self.connection.execute("UPDATE assets SET known_ip_addresses=ip_addresses")
+                # Recover earlier rotations from existing event history, one asset at a time.
+                for row in self.connection.execute("SELECT id,ip_addresses FROM assets"):
+                    known = set(json.loads(row["ip_addresses"]))
+                    seen = set()
+                    for event in self.connection.execute(
+                            "SELECT * FROM events WHERE asset_id=? ORDER BY id", (row["id"],)):
+                        seen.update(json.loads(event["previous_state"]).get("ip_addresses", []))
+                        current = set(json.loads(event["new_state"]).get("ip_addresses", []))
+                        if event["event_type"] == "dns_ip_changed" and current <= seen and not event["delivered_at"]:
+                            self.suppress_notification(event["id"], "known_ip_rotation")
+                        seen.update(current)
+                    known.update(seen)
+                    self.connection.execute("UPDATE assets SET known_ip_addresses=? WHERE id=?",
+                                            (json.dumps(ipv4_addresses(known)), row["id"]))
 
     def close(self):
         self.connection.close()
@@ -204,13 +283,16 @@ class Database:
                     new += 1
         return new
 
-    def assets(self, target_id=None, resolved=None, http=None, status=None):
+    def assets(self, target_id=None, resolved=None, http=None, status=None, source=None):
         clauses, params = [], []
         for column, value in (("target_id", target_id), ("dns_resolved", resolved),
                               ("http_available", http), ("http_status", status)):
             if value is not None:
                 clauses.append(f"a.{column}=?")
                 params.append(value)
+        if source is not None:
+            clauses.append("EXISTS (SELECT 1 FROM asset_sources s WHERE s.asset_id=a.id AND s.source=?)")
+            params.append(source)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         cursor = self.connection.execute(
             "SELECT a.*,t.name AS target FROM assets a JOIN targets t ON t.id=a.target_id"
@@ -284,12 +366,15 @@ class Database:
             before = decode_asset(row)
             now = utcnow()
             changed = before["ip_addresses"] != addresses
+            known = sorted(set(before["known_ip_addresses"]) | set(addresses))
             after = {**before, "dns_resolved": bool(addresses), "ip_addresses": addresses,
+                     "known_ip_addresses": known,
                      "dns_checked_at": now, "dns_version": before["dns_version"] + int(changed)}
             kinds = dns_events(before, addresses)
             self.connection.execute(
-                "UPDATE assets SET dns_resolved=?,ip_addresses=?,dns_checked_at=?,dns_version=dns_version+? WHERE id=?",
-                (bool(addresses), json.dumps(addresses), now, int(changed), asset_id))
+                "UPDATE assets SET dns_resolved=?,ip_addresses=?,known_ip_addresses=?,dns_checked_at=?,"
+                "dns_version=dns_version+? WHERE id=?",
+                (bool(addresses), json.dumps(addresses), json.dumps(known), now, int(changed), asset_id))
             if not addresses and before["http_available"]:
                 after.update(http_available=False, http_status=None, http_down_since=now,
                              previous_http_status=before["http_status"], http_metadata={"reason": "no_a_record"})
@@ -300,6 +385,27 @@ class Database:
                 kinds.append("http_service_disappeared")
             for kind in kinds:
                 self._event(asset_id, kind, before, after)
+
+    def observe_cnames(self, asset_id: int, names: list[str]):
+        records = sorted({name for raw in names if (name := normalize_hostname(raw))})
+        with self.transaction():
+            row = self.connection.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if row is None:
+                return
+            before = decode_asset(row)
+            now = utcnow()
+            after = {**before, "cname_records": records, "cname_checked_at": now}
+            self.connection.execute("UPDATE assets SET cname_records=?,cname_checked_at=? WHERE id=?",
+                                    (json.dumps(records), now, asset_id))
+            if before["cname_checked_at"] and before["cname_records"] != records:
+                self._event(asset_id, "dns_cname_changed", before, after)
+
+    def ip_batches(self, target_id: int, size: int):
+        cursor = self.connection.execute(
+            "SELECT DISTINCT j.value FROM assets a,json_each(a.ip_addresses) j "
+            "WHERE a.target_id=? ORDER BY j.value", (target_id,))
+        while rows := cursor.fetchmany(size):
+            yield [row[0] for row in rows]
 
     def observe_http(self, asset_id: int, observation: dict | None, dns_version: int):
         with self.transaction():
@@ -330,19 +436,179 @@ class Database:
             for kind in http_events(before, status):
                 self._event(asset_id, kind, before, after)
 
-    def next_run_at(self, target_id: int, watcher: str, interval: float) -> float:
+    def next_run_at(self, target_id: int, watcher: str, interval: float, retry_interval=None) -> float:
+        if self.connection.execute("SELECT 1 FROM run_requests WHERE target_id=? AND watcher=?",
+                                   (target_id, watcher)).fetchone():
+            return 0
         row = self.connection.execute(
-            "SELECT finished_at FROM watcher_runs WHERE target_id=? AND watcher=?", (target_id, watcher)).fetchone()
-        return row[0] + interval if row else 0
+            "SELECT finished_at,success FROM watcher_runs WHERE target_id=? AND watcher=?", (target_id, watcher)).fetchone()
+        if row and not row["success"] and retry_interval is not None:
+            interval = min(interval, retry_interval)
+        return row["finished_at"] + interval if row else 0
 
-    def due(self, target_id: int, watcher: str, interval: float) -> bool:
-        return self.next_run_at(target_id, watcher, interval) <= time.time()
+    def due(self, target_id: int, watcher: str, interval: float, retry_interval=None) -> bool:
+        return self.next_run_at(target_id, watcher, interval, retry_interval) <= time.time()
 
     def finished(self, target_id: int, watcher: str, success: bool):
         self.connection.execute(
             "INSERT INTO watcher_runs SELECT id,?,?,? FROM targets WHERE id=? "
             "ON CONFLICT(target_id,watcher) DO UPDATE SET finished_at=excluded.finished_at,success=excluded.success",
             (watcher, time.time(), success, target_id))
+        self.connection.execute(
+            "UPDATE watcher_status SET state=CASE WHEN state='skipped' THEN state ELSE ? END,"
+            "finished_at=? WHERE target_id=? AND watcher=?",
+            ("success" if success else "failed", time.time(), target_id, watcher))
+
+    def watcher_state(self, target_id: int, watcher: str, state: str, detail=""):
+        now = time.time()
+        if state == "queued":
+            self.connection.execute(
+                "INSERT INTO watcher_status(target_id,watcher,state,queued_at,detail) "
+                "SELECT id,?,?,?,? FROM targets WHERE id=? ON CONFLICT(target_id,watcher) DO UPDATE SET "
+                "state=excluded.state,queued_at=excluded.queued_at,started_at=NULL,finished_at=NULL,"
+                "detail=excluded.detail,last_error=NULL,results=0,new_assets=0",
+                (watcher, state, now, detail, target_id))
+        else:
+            self.connection.execute(
+                "UPDATE watcher_status SET state=?,detail=?,started_at=CASE WHEN ?='running' "
+                "THEN ? ELSE started_at END WHERE target_id=? AND watcher=?",
+                (state, detail, state, now, target_id, watcher))
+
+    def watcher_progress(self, target_id: int, watcher: str, detail: str, *, results=0, new_assets=0, error=None):
+        self.connection.execute(
+            "UPDATE watcher_status SET detail=?,results=results+?,new_assets=new_assets+?,"
+            "last_error=COALESCE(?,last_error) WHERE target_id=? AND watcher=?",
+            (detail[:1000], results, new_assets, error, target_id, watcher))
+
+    def request_run(self, target_id: int, watcher: str):
+        self.connection.execute("INSERT OR IGNORE INTO run_requests SELECT id,? FROM targets WHERE id=?",
+                                (watcher, target_id))
+
+    def consume_run_request(self, target_id: int, watcher: str):
+        self.connection.execute("DELETE FROM run_requests WHERE target_id=? AND watcher=?", (target_id, watcher))
+
+    def set_runtime(self, key: str, value):
+        self.connection.execute("INSERT INTO runtime_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                (key, json.dumps(value)))
+
+    def runtime(self, key: str, default=None):
+        row = self.connection.execute("SELECT value FROM runtime_state WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def program_feed_status(self, platform):
+        row = self.connection.execute("SELECT * FROM program_feeds WHERE platform=?", (platform,)).fetchone()
+        return dict(row) if row else None
+
+    def start_program_check(self, platform):
+        self.connection.execute(
+            "INSERT INTO program_feeds(platform,state,started_at) VALUES (?,'running',?) "
+            "ON CONFLICT(platform) DO UPDATE SET state='running',started_at=excluded.started_at,last_error=NULL",
+            (platform, time.time()))
+
+    def fail_program_check(self, platform, error, retry_after, state="failed"):
+        self.connection.execute(
+            "UPDATE program_feeds SET state=?,checked_at=?,next_run_at=?,last_error=? WHERE platform=?",
+            (state, time.time(), time.time() + retry_after, error, platform))
+
+    def observe_program_feed(self, platform, programs, interval):
+        # The caller validates the entire feed before any baseline or seen-set changes.
+        with self.transaction():
+            self.connection.execute("INSERT OR IGNORE INTO program_feeds(platform) VALUES (?)", (platform,))
+            baseline = self.program_feed_status(platform)["initialized_at"] is None
+            now = utcnow()
+            new_programs = new_scopes = scope_count = 0
+            for program in programs:
+                key = program["key"]
+                created = bool(self.connection.execute(
+                    "INSERT OR IGNORE INTO programs VALUES (?,?,?,?,?,?)",
+                    (platform, key, program["name"], program["url"], now, now)).rowcount)
+                self.connection.execute(
+                    "UPDATE programs SET name=?,url=?,last_seen=? WHERE platform=? AND program_key=?",
+                    (program["name"], program["url"], now, platform, key))
+                added = []
+                for item in program["scope"]:
+                    inserted = self.connection.execute(
+                        "INSERT OR IGNORE INTO program_scopes VALUES (?,?,?,?,?,?)",
+                        (platform, key, item["identifier"], item["type"], now, now)).rowcount
+                    self.connection.execute(
+                        "UPDATE program_scopes SET type=?,last_seen=? WHERE platform=? AND program_key=? AND identifier=?",
+                        (item["type"], now, platform, key, item["identifier"]))
+                    if inserted:
+                        added.append(item)
+                scope_count += len(program["scope"])
+                if not baseline and (created or added):
+                    kind = "new_program" if created else "scope_added"
+                    self._program_event(platform, program, kind, added, now)
+                    new_programs += int(created)
+                    new_scopes += len(added)
+            self.connection.execute(
+                "UPDATE program_feeds SET initialized_at=COALESCE(initialized_at,?),state=?,checked_at=?,"
+                "next_run_at=?,last_error=NULL,program_count=?,scope_count=?,new_programs=?,new_scopes=? WHERE platform=?",
+                (now, "baselined" if baseline else "success", time.time(), time.time() + interval,
+                 len(programs), scope_count, new_programs, new_scopes, platform))
+        return {"baseline": baseline, "new_programs": new_programs, "new_scopes": new_scopes}
+
+    def _program_event(self, platform, program, kind, added, now):
+        event_id = self.connection.execute(
+            "INSERT INTO program_events(platform,program_key,event_type,program_name,program_url,added_scope,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (platform, program["key"], kind, program["name"], program["url"], json.dumps(added), now)).lastrowid
+        event = {"id": event_id, "platform": platform, "event_type": kind, "program_name": program["name"],
+                 "program_url": program["url"], "added_scope": added, "created_at": now}
+        self.connection.executemany("INSERT INTO program_messages(event_id,part,text) VALUES (?,?,?)",
+                                    [(event_id, number, text) for number, text in enumerate(format_program_messages(event), 1)])
+        LOG.info("watcher=program_watch platform=%s program=%s event=%s event_id=P%s added_scopes=%s",
+                 platform, program["key"], kind, event_id, len(added))
+
+    def recent_program_events(self, platform=None, limit=10, offset=0):
+        clause = " WHERE platform=?" if platform else ""
+        params = (platform,) if platform else ()
+        rows = []
+        for row in self.connection.execute("SELECT * FROM program_events" + clause + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                                            (*params, limit, offset)):
+            event = dict(row)
+            event["added_scope"] = json.loads(event["added_scope"])
+            rows.append(event)
+        return rows
+
+    def pending_program_messages(self, limit):
+        return [dict(row) for row in self.connection.execute(
+            "SELECT m.*,e.platform,e.program_name,e.program_url,e.created_at,e.event_type,'program' AS queue "
+            "FROM program_messages m JOIN program_events e ON e.id=m.event_id "
+            "WHERE m.delivered_at IS NULL AND m.next_attempt_at<=? AND NOT EXISTS ("
+            "SELECT 1 FROM program_messages earlier WHERE earlier.event_id=m.event_id AND earlier.part<m.part "
+            "AND earlier.delivered_at IS NULL AND earlier.next_attempt_at>?) ORDER BY m.id LIMIT ?",
+            (time.time(), time.time(), limit))]
+
+    def program_notification_result(self, notification_id, error=None, message_id=None, retry_after=0):
+        now = utcnow()
+        self.connection.execute(
+            "UPDATE program_messages SET attempts=attempts+1,attempted_at=?,last_error=?,delivered_at=?,"
+            "next_attempt_at=?,message_id=? WHERE id=? AND delivered_at IS NULL",
+            (now, error, now if error is None else None, time.time() + retry_after,
+             str(message_id) if message_id is not None else None, notification_id))
+
+    def recent_events(self, target_id=None, kind=None, limit=10, offset=0):
+        clauses, params = [], []
+        if target_id is not None:
+            clauses.append("a.target_id=?")
+            params.append(target_id)
+        if kind is not None:
+            clauses.append("e.event_type=?")
+            params.append(kind)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return [dict(row) for row in self.connection.execute(
+            "SELECT e.*,a.hostname,t.name AS target FROM events e JOIN assets a ON a.id=e.asset_id "
+            "JOIN targets t ON t.id=a.target_id" + where + " ORDER BY e.id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset))]
+
+    def cname_assets(self, target_id=None, limit=20, offset=0):
+        clause = " AND a.target_id=?" if target_id is not None else ""
+        params = (target_id,) if target_id is not None else ()
+        return [decode_asset(row) for row in self.connection.execute(
+            "SELECT a.*,t.name AS target FROM assets a JOIN targets t ON t.id=a.target_id "
+            "WHERE a.cname_records!='[]'" + clause + " ORDER BY a.hostname,a.id LIMIT ? OFFSET ?",
+            (*params, limit, offset))]
 
     def pending_events(self, limit: int, *, exclude_types=()):
         # Filter before LIMIT so muted IP churn cannot starve discovery alerts.
