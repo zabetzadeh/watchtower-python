@@ -85,20 +85,26 @@ Six independent asynchronous tasks run passive discovery, TLSX, DNSX (A and CNAM
 HTTPX, DNS brute force and PTR discovery. Another task polls notifications at `intervals.monitoring`, draining
 full successful batches without waiting for another interval; state
 comparison happens immediately when observations are committed. Each task processes
-targets sequentially. Tools have bounded concurrency and a configurable overall
-timeout. Brute force has exclusive access to scan resources: it waits for active
-passive/TLSX/DNSX/HTTPX/PTR jobs to finish, then runs DNSGen and ShuffleDNS/MassDNS
-sequentially while other scan jobs wait. This applies across all targets. Queued
-jobs resume afterward; their intervals still run from completion. Telegram delivery
-and CLI inspection remain available. Subfinder, Chaos and crt.sh run each passive
+targets sequentially. All scan tools share **one FIFO execution slot** across all
+targets, with bounded tool threads and a configurable overall timeout. DNSGen seed
+batches and static/dynamic ShuffleDNS chunks release that slot between invocations,
+so DNS and HTTP monitoring can run during a long brute-force cycle. Waiting work is
+bounded by the watcher count; no task/thread is created per hostname. Telegram delivery,
+program feeds and CLI inspection remain available. Subfinder, Chaos and crt.sh run each passive
 cycle, with failures isolated by source and domain.
 Subfinder receives `-recursive`, selecting sources that support recursive
 subdomain queries; this flag alone does not repeatedly enumerate every discovered
 hostname. HTTPX receives `-auto-referer`, setting the Referer header to the request
 URL. `doctor` checks that the installed executables support both required flags.
 
-Intervals are seconds **after the previous run finishes**, persisted per target
-and watcher across restarts. Newly added targets are picked up without restarting.
+Discovery intervals are seconds **after the previous run finishes**, persisted per
+target and watcher across restarts. DNS/HTTP deadlines are persisted **per asset**
+in a deduplicated SQLite queue. Every new finding queues an immediate DNS check;
+a usable A record queues HTTP fingerprinting. Completed checks reschedule themselves
+at their own intervals. Unresolved names keep their DNS jobs; resolved hosts without
+HTTP keep both jobs. Successful batches survive restarts without repeating the whole
+target, and interrupted batches remain due. New findings do not wait for the target's
+next full discovery cycle. Newly added targets are picked up without restarting.
 Failed or partially inconclusive runs retry after the smaller of their normal interval
 and `runtime.failure_retry_interval` (default 300 seconds). This also applies to
 previously failed runs stored before upgrading, so a missing resolver file no longer
@@ -136,20 +142,29 @@ The cache and generation checkpoint survive restarts. Failed or interrupted seed
 batches are retried, with partial cached output deduplicated; completed batches
 are skipped. A ShuffleDNS failure does not discard the cache or regenerate seeds.
 Candidate export and output ingestion use bounded batches and temporary files.
+`dns_bruteforce.static.chunk_size` bounds words read from disk at once;
+`dns_bruteforce.dynamic.chunk_size` bounds cached names sent to each ShuffleDNS run
+(both default to 5000). The wordlist is streamed, not accumulated as a list of chunks.
+`dns_bruteforce.shuffledns.cooldown` pauses between chunks (default one second).
+Failed chunks are logged and other chunks continue; failed cycles retry on the failure
+interval. A retry may revisit successful brute-force chunks, with findings deduplicated.
 The cache grows on disk as findings accumulate; removing a target also removes its
 candidate cache and checkpoint. Existing databases gain these tables automatically.
 
 ShuffleDNS receives both `-t` and `-wt` from `dns_bruteforce.shuffledns.threads`,
-and invokes the configured MassDNS executable. Static and dynamic runs feed the
+and invokes the configured MassDNS executable. It also receives `-sw` to check every
+result for wildcard DNS, including small chunks below its usual IP-count threshold
+([ShuffleDNS options](https://github.com/projectdiscovery/shuffledns#usage)). Static and dynamic runs feed the
 same monitoring pipeline as passive and certificate discoveries.
 
 Brute-force logs show each domain/wordlist, DNSGen seed batch, cached candidate
-count and `new_asset_events` queued for notification. Tool heartbeats show elapsed
+count and `new_assets` with `validation=queued`. A stored finding is not yet an alert.
+Tool heartbeats show elapsed
 time and output sizes every `runtime.progress_interval` seconds (default 30), even
 when a tool is silent. These are activity indicators, not a percentage of completed
 DNS queries. Output is ingested after each tool completes successfully. The scheduler
 logs queued/started jobs and the next run time, including persisted weekly schedules
-after a restart. `state=queued` means the watcher is waiting for scan resources.
+after a restart. `tool=... state=queued` means that tool is waiting for its execution slot.
 
 Ctrl+C and SIGTERM cancel watcher tasks, terminate tool process groups (including
 MassDNS children), and close the database. One daemon can own a database at a time;
@@ -168,7 +183,7 @@ filesystem. Back up using SQLite's backup API, or stop the daemon before copying
 
 The watcher downloads the raw JSON versions of those files. It is enabled by default
 and runs once per hour, independently for each feed, even with no configured scan
-targets or while brute force holds scan access. Set these values in your YAML to
+targets or while a brute-force tool is running. Set these values in your YAML to
 change its interval or disable it:
 
 ```yaml
@@ -290,6 +305,21 @@ the same domain under two targets gives each its own independent state.
 Events: `fresh_asset`, `fresh_subdomain`, `dns_unresolved`, `dns_ip_changed`, `dns_cname_changed`,
 `http_service_appeared`, `http_service_disappeared`, `http_service_returned`, and
 `http_status_changed`. Fresh-asset messages identify certificate/brute-force/PTR sources.
+**Asset alerts require a usable IPv4 A record and a confirmed HTTP response.**
+Any HTTP status from 100 through 599 qualifies, including 403/500; success does not
+mean only status 200. Raw discovery, DNS-only findings, timeouts and failed probes
+stay silent. All accepted hostnames remain visible in `assets --all` and target
+exports, including those that have never qualified for an alert.
+
+The first confirmed live response releases **one** fresh-asset alert containing its
+DNS/HTTP state, source, URL, page title, server and detected technologies. Initial
+DNS resolution/HTTP appearance events remain in history with `initial_validation`
+suppression, avoiding three alerts for one finding. If a name becomes live later,
+it qualifies then. Subsequent DNS changes, HTTP status changes, outages and returns
+for previously validated assets retain their alerts. Pending unvalidated findings
+cannot block eligible notifications. Validation and delivery survive restarts, and
+old databases recover validation from their first recorded live HTTP observation.
+
 Unchanged observations generate no new event. A later repeat of a real transition
 (200 → 403 → 200 → 403) creates a new event for each occurrence.
 
@@ -340,7 +370,9 @@ DNSX CNAME request so an A-record failure cannot erase valid CNAME state. Extern
 alias destinations are stored as record data, without adding them to scan scope.
 The first conclusive CNAME observation establishes a silent baseline. Later
 additions, removals and replacements generate `dns_cname_changed` events with both
-old and new sets, independent of IP/CDN notification filtering. Identical normalized
+old and new sets, independent of IP/CDN notification filtering. Telegram delivery
+requires that the asset has qualified through DNS + HTTP validation; changes for
+never-valid names remain inspectable in CLI history. Identical normalized
 sets stay quiet. These alerts are investigation signals, not proof of a takeover;
 no takeover probing or exploitation is performed. `cnames` and `/cnames` list current
 records; `changes --type dns_cname_changed` provides their history.
@@ -358,6 +390,15 @@ inconclusive. DNS loss marks any active HTTP service down without probing. Resul
 from an HTTP batch are discarded if its DNS state or IP set changed in flight.
 HTTPX uses its default HTTPS-first/HTTP-fallback behavior, does not follow redirects,
 and records one representative HTTP service per hostname (not every port/scheme).
+Every HTTP check includes `-tech-detect` and refreshes the stored fingerprint, even
+when the status stays unchanged. `runtime.dns_rate_limit` (default 50) caps DNSX
+queries/second and `runtime.http_rate_limit` (default 10) caps HTTPX requests/second.
+`runtime.http_max_response_bytes` (default 1048576) bounds each HTTP response read;
+fingerprints may be incomplete for pages larger than that cap. Tool concurrency
+still follows `runtime.threads`. ShuffleDNS uses its own bounded threads, chunks
+and cooldown; its thread setting is not a requests-per-second limit.
+These are the tools' documented [DNSX rate limit](https://docs.projectdiscovery.io/opensource/dnsx/usage)
+and [HTTPX fingerprint/rate/response-size options](https://docs.projectdiscovery.io/opensource/httpx/usage).
 
 Telegram is disabled initially. The supplied config reads credentials from environment
 variables; no literal bot credentials are needed in YAML. To enable it:
@@ -376,6 +417,9 @@ intervals:
 runtime:
   progress_interval: 30   # Seconds between running-tool heartbeats
   failure_retry_interval: 300
+  dns_rate_limit: 50
+  http_rate_limit: 10
+  http_max_response_bytes: 1048576
 telegram:
   notify_dns_ip_changes: true
   commands_enabled: true
@@ -387,16 +431,14 @@ cdn:
   max_age: 604800
 ```
 
-Brute force sends a fresh-asset alert only for a hostname newly inserted into the
-target's asset table. Rediscovering an existing hostname records its source without
-another fresh-asset alert; zero new findings means zero such alerts. Check
-`new_asset_events` in the logs, `telegram=disabled`/`telegram=failed`, and the scheduled
-next run when diagnosing missing messages. A successful delivery logs its event
-type and ID. Delivery requires `telegram.enabled: true` and valid credentials.
-The outbox interval controls how soon new events are picked up: 12000 means up to
-3 hours 20 minutes even before any delivery backlog. Existing eligible backlogs
-now drain continuously in bounded batches, respecting `telegram.send_delay` and
-server retry delays.
+Brute-force results enter the normal validation queue. Rediscovering an existing
+hostname records its source without another fresh-asset alert. Check `new_assets`
+and `validation=queued` in the logs, then `health` for assets awaiting validation,
+due DNS/HTTP checks and the deliverable notification backlog. A successful delivery
+logs its event type and ID. Delivery requires `telegram.enabled: true` and valid
+credentials. New events wake the outbox immediately; `intervals.monitoring` is its
+fallback polling/retry interval. Eligible backlogs drain in bounded batches,
+respecting `telegram.send_delay` and server retry delays.
 
 ### Bot menu and module diagnostics
 
@@ -419,7 +461,7 @@ Commands only reply to the numeric chat ID in `telegram.chat_id`; other chats ar
 ignored. Everyone in that configured group can read the reports. No target changes
 or scans can be initiated through the bot. Set `telegram.commands_enabled: false`
 to keep notifications only. Updates use persisted offsets, independent of notification
-backlogs and scan locks. Telegram's `getUpdates` requires that the bot has no active
+backlogs and the scan-tool queue. Telegram's `getUpdates` requires that the bot has no active
 webhook or other polling consumer; failures appear in terminal/CLI health reports.
 
 `assetwatch health` works even while the daemon is stopped. It distinguishes
@@ -451,10 +493,13 @@ For brute-force or TLSX troubleshooting:
 
 State and its event commit atomically. Events queue while Telegram is disabled or
 unreachable and are delivered after it is enabled, including the existing backlog,
-subject to the configured IP-alert policy and CDN filter.
+subject to DNS + HTTP validation, the configured IP-alert policy and CDN filter.
 Acknowledged events are not resent; failed attempts and server retry delays are
-stored. Plain-text messages avoid Markdown injection. Fresh assets may show
-DNS/HTTP `PENDING`; later transitions arrive separately.
+stored. Asset alerts use Telegram MarkdownV2 with bold labels and code-formatted
+hostnames, IPs, URLs and fingerprints. Dynamic text is escaped, and long fields
+are shortened without cutting Markdown entities. Full fingerprints remain in the
+database and CLI JSON. Fresh alerts show the first validated snapshot and its
+observation time, even if delivery was delayed while Telegram was offline.
 
 Telegram offers no idempotency key for sendMessage: if Telegram accepts a message
 but its response is lost (or the process stops before recording the acknowledgement),

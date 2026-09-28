@@ -93,9 +93,11 @@ class Watchers:
             LOG.info("target=%s watcher=ptr_discovery state=skipped reason=no_ip_inputs", target["name"])
         return success
 
-    async def dns_resolution(self, target):
+    async def dns_resolution(self, target, *, queued_only=False):
         success = True
-        for batch in self.db.asset_batches(target["id"], self.config["runtime"]["batch_size"]):
+        for batch in self.db.asset_batches(target["id"], self.config["runtime"]["batch_size"],
+                                          due_watcher="dns_resolution" if queued_only else None):
+            observations, cnames = {}, {}
             try:
                 observations = await self.tools.dns([asset["hostname"] for asset in batch])
                 for asset in batch:
@@ -127,27 +129,40 @@ class Watchers:
                 success = False
                 self.error(target, "dns_resolution", error)
                 LOG.error("target=%s watcher=dns_resolution record=cname error=%s state_preserved=true", target["name"], error)
+            for asset in batch:
+                delay = self.config["intervals"]["dns_resolution"]
+                if asset["hostname"] not in observations or asset["hostname"] not in cnames:
+                    delay = min(delay, self.config["runtime"]["failure_retry_interval"])
+                self.db.schedule_check(asset["id"], "dns_resolution", delay)
         return success
 
-    async def http_probe(self, target):
+    async def http_probe(self, target, *, queued_only=False):
         success = True
-        for batch in self.db.asset_batches(target["id"], self.config["runtime"]["batch_size"], resolved_only=True):
+        for batch in self.db.asset_batches(target["id"], self.config["runtime"]["batch_size"], resolved_only=True,
+                                          due_watcher="http_probe" if queued_only else None):
+            observed = set()
             try:
                 observations = await self.tools.http([asset["hostname"] for asset in batch])
                 for asset in batch:
                     if asset["hostname"] in observations:
-                        self.db.observe_http(asset["id"], observations[asset["hostname"]], asset["dns_version"])
+                        if self.db.observe_http(asset["id"], observations[asset["hostname"]], asset["dns_version"]):
+                            observed.add(asset["id"])
                 LOG.info("target=%s watcher=http_probe checked=%s available=%s inconclusive=%s",
-                         target["name"], len(batch), sum(value is not None for value in observations.values()),
-                         len(batch) - len(observations))
-                self.db.watcher_progress(target["id"], "http_probe", f"HTTP checked={len(batch)}", results=len(observations))
-                if len(observations) < len(batch):
+                         target["name"], len(batch), sum(asset["id"] in observed and observations[asset["hostname"]] is not None
+                                                        for asset in batch), len(batch) - len(observed))
+                self.db.watcher_progress(target["id"], "http_probe", f"HTTP checked={len(batch)}", results=len(observed))
+                if len(observed) < len(batch):
                     success = False
-                    self.error(target, "http_probe", "Inconclusive HTTP responses; previous state preserved")
+                    self.error(target, "http_probe", "Inconclusive or stale HTTP responses; previous state preserved")
             except Exception as error:
                 success = False
                 self.error(target, "http_probe", error)
                 LOG.error("target=%s watcher=http_probe error=%s state_preserved=true", target["name"], error)
+            for asset in batch:
+                delay = self.config["intervals"]["http_probe"]
+                if asset["id"] not in observed:
+                    delay = min(delay, self.config["runtime"]["failure_retry_interval"])
+                self.db.schedule_check(asset["id"], "http_probe", delay)
         return success
 
     async def dns_bruteforce(self, target):
@@ -184,32 +199,29 @@ class Watchers:
                     LOG.info("target=%s domain=%s mode=static wordlist=%s wordlist_number=%s wordlists=%s state=started",
                              target["name"], domain, wordlist.name, number, len(wordlists))
                     try:
-                        with wordlist.open("r", encoding="utf-8", errors="replace") as stream:
-                            chunks = []
-                            current = []
-                            for line in stream:
-                                word = line.strip()
-                                if word and not word.startswith("#"):
-                                    current.append(word)
-                                    if len(current) >= chunk_size:
-                                        chunks.append(current)
-                                        current = []
-                            if current:
-                                chunks.append(current)
-                        total_chunks = len(chunks) or 1
-                        with tempfile.TemporaryDirectory(prefix="assetwatch-brute-chunk-") as tmpdir:
+                        with wordlist.open(encoding="utf-8", errors="replace") as stream, \
+                                tempfile.TemporaryDirectory(prefix="assetwatch-brute-chunk-") as tmpdir:
                             chunk_file = Path(tmpdir) / "chunk.txt"
-                            for chunk_num, words in enumerate(chunks, 1):
+                            words_iter = (word for line in stream if (word := line.strip()) and not word.startswith("#"))
+                            chunk_num = 0
+                            while words := list(islice(words_iter, chunk_size)):
+                                chunk_num += 1
+                                if chunk_num > 1:
+                                    await asyncio.sleep(cooldown)
                                 chunk_file.write_text("\n".join(words) + "\n", encoding="utf-8")
                                 self.db.watcher_progress(
                                     target["id"], "dns_bruteforce",
-                                    f"Static: {domain}, wordlist {number}/{len(wordlists)} ({wordlist.name}) chunk {chunk_num}/{total_chunks} ({len(words)} words)")
-                                async with self.tools.shuffledns(domain, wordlist=chunk_file) as names:
-                                    new = await self.ingest(target, names, "dns_bruteforce")
-                                LOG.info("target=%s domain=%s mode=static wordlist=%s chunk=%s/%s words=%s state=finished new_asset_events=%s",
-                                         target["name"], domain, wordlist.name, chunk_num, total_chunks, len(words), new)
-                                if chunk_num < total_chunks and cooldown > 0:
-                                    await asyncio.sleep(cooldown)
+                                    f"Static: {domain}, wordlist {number}/{len(wordlists)} ({wordlist.name}) chunk {chunk_num} ({len(words)} words)")
+                                try:
+                                    async with self.tools.shuffledns(domain, wordlist=chunk_file) as names:
+                                        new = await self.ingest(target, names, "dns_bruteforce")
+                                    LOG.info("target=%s domain=%s mode=static wordlist=%s chunk=%s words=%s state=finished new_assets=%s validation=queued",
+                                             target["name"], domain, wordlist.name, chunk_num, len(words), new)
+                                except Exception as error:
+                                    success = False
+                                    self.error(target, "dns_bruteforce", error)
+                                    LOG.error("target=%s domain=%s wordlist=%s chunk=%s error=%s",
+                                              target["name"], domain, wordlist.name, chunk_num, error)
                     except Exception as error:
                         success = False
                         self.error(target, "dns_bruteforce", error)
@@ -253,28 +265,32 @@ class Watchers:
                 failures.append("dnsgen")
             LOG.info("target=%s tool=dnsgen new_seeds=%s new_candidates=%s", target["name"], seeds, new_candidates)
 
-            # Reuse the full cache, including previously unresolved candidates. Only
-            # one domain's input is exported at a time, in bounded database batches.
+            # Each cached chunk takes one tool slot. Monitoring gets a turn between
+            # chunks, and ShuffleDNS never loads an entire target's cache at once.
             path = directory / "candidates.txt"
+            chunk_size = self.config["dns_bruteforce"]["dynamic"]["chunk_size"]
+            cooldown = self.config["dns_bruteforce"]["shuffledns"]["cooldown"]
             for domain in target["domains"]:
                 count = 0
-                with path.open("w", encoding="utf-8") as stream:
-                    for batch in self.db.dnsgen_candidate_batches(target["id"], domain, batch_size):
-                        stream.writelines(hostname + "\n" for hostname in batch)
-                        count += len(batch)
-                        await asyncio.sleep(0)
-                if path.stat().st_size:
+                failed = False
+                for number, batch in enumerate(self.db.dnsgen_candidate_batches(target["id"], domain, chunk_size), 1):
+                    if number > 1:
+                        await asyncio.sleep(cooldown)
+                    path.write_text("".join(hostname + "\n" for hostname in batch), encoding="utf-8")
+                    count += len(batch)
                     self.db.watcher_progress(target["id"], "dns_bruteforce", f"Dynamic: {domain}, cached_candidates={count}")
                     LOG.info("target=%s domain=%s mode=dynamic cached_candidates=%s state=started", target["name"], domain, count)
                     try:
                         async with self.tools.shuffledns(domain, candidates=path) as names:
                             new = await self.ingest(target, names, "dns_bruteforce")
-                        LOG.info("target=%s domain=%s mode=dynamic state=finished new_asset_events=%s",
-                                 target["name"], domain, new)
+                        LOG.info("target=%s domain=%s mode=dynamic chunk=%s state=finished new_assets=%s validation=queued",
+                                 target["name"], domain, number, new)
                     except Exception as error:
                         LOG.error("target=%s domain=%s mode=dynamic error=%s", target["name"], domain, error)
-                        failures.append(domain)
-                else:
+                        failed = True
+                if failed:
+                    failures.append(domain)
+                if not count:
                     LOG.info("target=%s domain=%s mode=dynamic state=skipped reason=no_cached_candidates",
                              target["name"], domain)
             if failures:

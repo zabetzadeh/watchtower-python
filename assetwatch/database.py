@@ -45,6 +45,16 @@ CREATE TABLE IF NOT EXISTS asset_sources (
     source TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
     PRIMARY KEY(asset_id, source)
 );
+CREATE TABLE IF NOT EXISTS monitoring_jobs (
+    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    watcher TEXT NOT NULL, due_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(asset_id, watcher)
+);
+CREATE INDEX IF NOT EXISTS idx_monitoring_due ON monitoring_jobs(watcher, due_at, asset_id);
+CREATE TABLE IF NOT EXISTS asset_validations (
+    asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL, state TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -195,6 +205,23 @@ class Database:
                     known.update(seen)
                     self.connection.execute("UPDATE assets SET known_ip_addresses=? WHERE id=?",
                                             (json.dumps(ipv4_addresses(known)), row["id"]))
+            # A durable, deduplicated queue also upgrades old databases. Rows remain
+            # scheduled after checks, so unresolved/old assets are never forgotten.
+            self.connection.execute("INSERT OR IGNORE INTO monitoring_jobs(asset_id,watcher) "
+                                    "SELECT id,'dns_resolution' FROM assets")
+            self.connection.execute("INSERT OR IGNORE INTO monitoring_jobs(asset_id,watcher) "
+                                    "SELECT id,'http_probe' FROM assets WHERE dns_resolved=1")
+            # Recover the first proven live state without sending legacy raw findings.
+            for row in self.connection.execute(
+                    "SELECT * FROM assets a WHERE http_ever_available=1 "
+                    "AND NOT EXISTS (SELECT 1 FROM asset_validations v WHERE v.asset_id=a.id)"):
+                event = self.connection.execute(
+                    "SELECT id,new_state FROM events WHERE asset_id=? "
+                    "AND event_type IN ('http_service_appeared','http_service_returned') ORDER BY id LIMIT 1",
+                    (row["id"],)).fetchone()
+                state = json.loads(event["new_state"]) if event else decode_asset(row)
+                if state.get("dns_resolved") and state.get("http_available"):
+                    self._validate_asset(row["id"], state, event["id"] if event else 0)
 
     def close(self):
         self.connection.close()
@@ -314,6 +341,8 @@ class Database:
                     "INSERT INTO asset_sources VALUES (?,?,?,?) ON CONFLICT(asset_id,source) "
                     "DO UPDATE SET last_seen=excluded.last_seen", (row["id"], source, now, now))
                 if created:
+                    self.connection.execute("INSERT INTO monitoring_jobs(asset_id,watcher) VALUES (?,'dns_resolution')",
+                                            (row["id"],))
                     self._event(row["id"], "fresh_asset", {}, {**decode_asset(row), "source": source})
                     new += 1
         return new
@@ -347,19 +376,26 @@ class Database:
                 "SELECT source FROM asset_sources WHERE asset_id=? ORDER BY source", (row["id"],))]
             yield asset
 
-    def asset_batches(self, target_id: int, size: int, resolved_only=False, after_id=0):
+    def asset_batches(self, target_id: int, size: int, resolved_only=False, after_id=0, due_watcher=None):
         maximum = self.connection.execute(
             "SELECT COALESCE(MAX(id),0) FROM assets WHERE target_id=?", (target_id,)).fetchone()[0]
         last = after_id
+        cutoff = time.time()
         while last < maximum:
+            due = (" AND EXISTS (SELECT 1 FROM monitoring_jobs j WHERE j.asset_id=assets.id "
+                   "AND j.watcher=? AND j.due_at<=?)") if due_watcher else ""
             rows = self.connection.execute(
                 "SELECT * FROM assets WHERE target_id=? AND id>? AND id<=?"
-                + (" AND dns_resolved=1" if resolved_only else "") + " ORDER BY id LIMIT ?",
-                (target_id, last, maximum, size)).fetchall()
+                + (" AND dns_resolved=1" if resolved_only else "") + due + " ORDER BY id LIMIT ?",
+                (target_id, last, maximum, *((due_watcher, cutoff) if due_watcher else ()), size)).fetchall()
             if not rows:
                 break
             last = rows[-1]["id"]
             yield [decode_asset(row) for row in rows]
+
+    def schedule_check(self, asset_id, watcher, delay):
+        self.connection.execute("UPDATE monitoring_jobs SET due_at=? WHERE asset_id=? AND watcher=?",
+                                (time.time() + delay, asset_id, watcher))
 
     def pending_dnsgen_batches(self, target_id: int, size: int):
         row = self.connection.execute(
@@ -427,6 +463,13 @@ class Database:
                     "http_down_since=?,http_metadata=? WHERE id=?",
                     (now, json.dumps(after["http_metadata"]), asset_id))
                 kinds.append("http_service_disappeared")
+            if addresses:
+                self.connection.execute(
+                    "INSERT INTO monitoring_jobs VALUES (?,'http_probe',0) ON CONFLICT(asset_id,watcher) "
+                    "DO UPDATE SET due_at=CASE WHEN ? THEN 0 ELSE due_at END", (asset_id, changed))
+            else:
+                self.connection.execute("DELETE FROM monitoring_jobs WHERE asset_id=? AND watcher='http_probe'",
+                                        (asset_id,))
             for kind in kinds:
                 self._event(asset_id, kind, before, after)
 
@@ -455,7 +498,7 @@ class Database:
         with self.transaction():
             row = self.connection.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
             if row is None or not row["dns_resolved"] or row["dns_version"] != dns_version:
-                return  # Discard results if DNS changed while HTTPX was in flight.
+                return False  # Discard results if DNS changed while HTTPX was in flight.
             before = decode_asset(row)
             status = observation["status_code"] if observation else None
             if status is not None and (type(status) is not int or not 100 <= status <= 599):
@@ -479,11 +522,32 @@ class Database:
                  down_since, after["http_url"], json.dumps(after["http_metadata"]), asset_id))
             for kind in http_events(before, status):
                 self._event(asset_id, kind, before, after)
+            if status is not None:
+                event_id = self.connection.execute("SELECT COALESCE(MAX(id),0) FROM events WHERE asset_id=?",
+                                                   (asset_id,)).fetchone()[0]
+                self._validate_asset(asset_id, after, event_id)
+            return True
+
+    def _validate_asset(self, asset_id, state, event_id):
+        created = self.connection.execute("INSERT OR IGNORE INTO asset_validations VALUES (?,?,?)",
+                                          (asset_id, event_id, json.dumps(state))).rowcount
+        if created:
+            # Keep complete history; initial DNS/HTTP events are covered by one
+            # validated fresh-asset message, not three notifications per finding.
+            self.connection.execute(
+                "INSERT OR IGNORE INTO notification_suppressions SELECT id,'initial_validation',? FROM events "
+                "WHERE asset_id=? AND id<=? AND event_type!='fresh_asset' AND delivered_at IS NULL",
+                (utcnow(), asset_id, event_id))
 
     def next_run_at(self, target_id: int, watcher: str, interval: float, retry_interval=None) -> float:
         if self.connection.execute("SELECT 1 FROM run_requests WHERE target_id=? AND watcher=?",
                                    (target_id, watcher)).fetchone():
             return 0
+        if watcher in {"dns_resolution", "http_probe"}:
+            row = self.connection.execute(
+                "SELECT MIN(j.due_at) FROM monitoring_jobs j JOIN assets a ON a.id=j.asset_id "
+                "WHERE a.target_id=? AND j.watcher=?", (target_id, watcher)).fetchone()
+            return row[0] if row[0] is not None else float("inf")
         row = self.connection.execute(
             "SELECT finished_at,success FROM watcher_runs WHERE target_id=? AND watcher=?", (target_id, watcher)).fetchone()
         if row and not row["success"] and retry_interval is not None:
@@ -529,7 +593,11 @@ class Database:
                                 (watcher, target_id))
 
     def consume_run_request(self, target_id: int, watcher: str):
-        self.connection.execute("DELETE FROM run_requests WHERE target_id=? AND watcher=?", (target_id, watcher))
+        consumed = self.connection.execute("DELETE FROM run_requests WHERE target_id=? AND watcher=?",
+                                            (target_id, watcher)).rowcount
+        if consumed and watcher in {"dns_resolution", "http_probe"}:
+            self.connection.execute("UPDATE monitoring_jobs SET due_at=0 WHERE watcher=? "
+                                    "AND asset_id IN (SELECT id FROM assets WHERE target_id=?)", (watcher, target_id))
 
     def set_runtime(self, key: str, value):
         self.connection.execute("INSERT INTO runtime_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -654,17 +722,29 @@ class Database:
             "WHERE a.cname_records!='[]'" + clause + " ORDER BY a.hostname,a.id LIMIT ? OFFSET ?",
             (*params, limit, offset))]
 
-    def pending_events(self, limit: int, *, exclude_types=()):
+    def pending_events(self, limit: int, *, exclude_types=(), validated_only=False):
         # Filter before LIMIT so muted IP churn cannot starve discovery alerts.
         exclusion = ""
         if exclude_types:
             exclusion = " AND e.event_type NOT IN (" + ",".join("?" for _ in exclude_types) + ")"
+        if validated_only:
+            exclusion += " AND EXISTS (SELECT 1 FROM asset_validations v WHERE v.asset_id=a.id)"
         rows = self.connection.execute(
             "SELECT e.*,a.hostname,t.name AS target FROM events e JOIN assets a ON a.id=e.asset_id "
             "JOIN targets t ON t.id=a.target_id WHERE e.delivered_at IS NULL AND e.next_attempt_at<=? "
             "AND NOT EXISTS (SELECT 1 FROM notification_suppressions s WHERE s.event_id=e.id)"
             + exclusion + " ORDER BY e.id LIMIT ?", (time.time(), *exclude_types, limit)).fetchall()
-        return [dict(row) for row in rows]
+        events = [dict(row) for row in rows]
+        if validated_only:
+            for event in events:
+                if event["event_type"] == "fresh_asset":
+                    state = json.loads(self.connection.execute(
+                        "SELECT state FROM asset_validations WHERE asset_id=?", (event["asset_id"],)).fetchone()[0])
+                    state["source"] = json.loads(event["new_state"]).get("source", "unknown")
+                    event["new_state"] = json.dumps(state)
+                event["sources"] = [row[0] for row in self.connection.execute(
+                    "SELECT source FROM asset_sources WHERE asset_id=? ORDER BY source", (event["asset_id"],))]
+        return events
 
     def suppress_notification(self, event_id: int, reason: str):
         self.connection.execute(

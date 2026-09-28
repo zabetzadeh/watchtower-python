@@ -150,9 +150,11 @@ async def doctor(config):
                 if name == "subfinder":
                     required_flags.append("-recursive")
                 if name == "httpx":
-                    required_flags.append("-auto-referer")
+                    required_flags += ["-auto-referer", "-tech-detect", "-rate-limit", "-response-size-to-read"]
                 if name == "dnsx":
-                    required_flags += ["-ptr", "-resp-only", "-cname", "-stream"]
+                    required_flags += ["-ptr", "-resp-only", "-cname", "-stream", "-rate-limit"]
+                if name == "shuffledns":
+                    required_flags += ["-strict-wildcard", "-wt"]
                 missing = [flag for flag in required_flags if flag not in help_text]
                 if missing:
                     raise ValueError("Missing flags: " + ", ".join(missing) + "; check/update the configured executable")

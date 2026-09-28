@@ -1,6 +1,7 @@
 """Read-only reports shared by the terminal and Telegram commands."""
 
 import json
+import math
 import shutil
 import time
 from collections import deque
@@ -12,7 +13,7 @@ from .logging_config import redact
 
 
 def timestamp(value):
-    return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds") if value else "-"
+    return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds") if value and math.isfinite(value) else "-"
 
 
 def prerequisites(config, target, watcher):
@@ -69,9 +70,12 @@ def health_report(config, db, target_id=None):
                           prerequisites=prerequisites(config, target, watcher))
             if status["state"] in {"running", "queued"}:
                 status["next_run_at"] = None
+            elif not math.isfinite(status["next_run_at"]):
+                status["next_run_at"] = None
             modules.append(status)
     counts = dict(db.connection.execute(
         "SELECT event_type,count(*) FROM events e WHERE delivered_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM asset_validations v WHERE v.asset_id=e.asset_id) "
         "AND NOT EXISTS (SELECT 1 FROM notification_suppressions s WHERE s.event_id=e.id) GROUP BY event_type"))
     muted = 0 if config["telegram"]["notify_dns_ip_changes"] else counts.pop("dns_ip_changed", 0)
     feeds = []
@@ -87,10 +91,15 @@ def health_report(config, db, target_id=None):
             feed["state"] = "interrupted/stale"
         feeds.append(feed)
     program_backlog = db.connection.execute("SELECT count(*) FROM program_messages WHERE delivered_at IS NULL").fetchone()[0]
+    awaiting_validation = db.connection.execute(
+        "SELECT count(*) FROM assets a WHERE NOT EXISTS (SELECT 1 FROM asset_validations v WHERE v.asset_id=a.id)").fetchone()[0]
+    due_checks = dict(db.connection.execute(
+        "SELECT watcher,count(*) FROM monitoring_jobs WHERE due_at<=? GROUP BY watcher", (now,)))
     return {"daemon": "running" if live else "stopped or stale", "heartbeat_at": daemon.get("heartbeat_at"),
             "telegram_enabled": config["telegram"]["enabled"],
             "commands_enabled": config["telegram"]["commands_enabled"],
             "notification_backlog": sum(counts.values()) + program_backlog, "muted_ip_events": muted,
+            "awaiting_validation": awaiting_validation, "due_checks": due_checks,
             "program_notification_backlog": program_backlog, "program_feeds": feeds,
             "delivery": db.runtime("delivery", {}), "bot": db.runtime("bot", {}),
             "log_file": str(config.path(config["logging"]["file"])), "modules": modules}
@@ -101,6 +110,9 @@ def health_text(report):
              f"Telegram: {'enabled' if report['telegram_enabled'] else 'disabled'}; "
              f"commands={'enabled' if report['commands_enabled'] else 'disabled'}; "
              f"pending={report['notification_backlog']}; muted IP events={report['muted_ip_events']}"]
+    lines.append(f"Assets awaiting DNS + HTTP validation: {report['awaiting_validation']}; "
+                 f"due DNS checks={report['due_checks'].get('dns_resolution', 0)}; "
+                 f"due HTTP checks={report['due_checks'].get('http_probe', 0)}")
     for name in ("delivery", "bot"):
         if report[name]:
             lines.append(f"{name}: {report[name].get('state')} {report[name].get('error', '')}")
@@ -115,6 +127,7 @@ def health_text(report):
     for row in report["modules"]:
         next_run = ("after this run completes" if row["state"] == "running" else
                     "waiting for scan access" if row["state"] == "queued" else
+                    "waiting for eligible assets" if row["next_run_at"] is None else
                     timestamp(row["next_run_at"]) if row["next_run_at"] else "due / requested")
         lines += ["", f"{row['target']} / {row['watcher']}: {row['state']}",
                   f"Started: {timestamp(row.get('started_at'))}; finished: {timestamp(row.get('finished_at'))}",

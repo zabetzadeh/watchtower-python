@@ -25,6 +25,7 @@ DEFAULTS = {
     "program_watch": {"enabled": True, "max_feed_bytes": 32 * 1024 * 1024},
     "runtime": {"batch_size": 500, "tool_timeout": 1800,
                 "request_timeout": 30, "threads": 10, "poll_interval": 1,
+                "dns_rate_limit": 50, "http_rate_limit": 10, "http_max_response_bytes": 1048576,
                 "progress_interval": 30, "failure_retry_interval": 300},
     "chaos": {"api_key": ""},
     "cdn": {"enabled": True, "refresh_interval": 86400, "retry_interval": 3600,
@@ -99,7 +100,8 @@ def load_config(filename: str | Path = "config.yaml") -> Config:
     for name, value in values["intervals"].items():
         positive(value, f"intervals.{name}")
     for name, value in values["runtime"].items():
-        positive(value, f"runtime.{name}", name in {"batch_size", "threads"})
+        positive(value, f"runtime.{name}", name in {"batch_size", "threads", "dns_rate_limit",
+                                                  "http_rate_limit", "http_max_response_bytes"})
     for section in (values["telegram"], values["cdn"], values["program_watch"], values["dns_bruteforce"]["static"],
                     values["dns_bruteforce"]["dynamic"]):
         if not isinstance(section["enabled"], bool):
@@ -125,7 +127,9 @@ def load_config(filename: str | Path = "config.yaml") -> Config:
     positive(values["dns_bruteforce"]["dynamic"]["batch_size"], "dns_bruteforce.dynamic.batch_size", True)
     positive(values["dns_bruteforce"]["static"]["chunk_size"], "dns_bruteforce.static.chunk_size", True)
     positive(values["dns_bruteforce"]["dynamic"]["chunk_size"], "dns_bruteforce.dynamic.chunk_size", True)
-    if not isinstance(values["dns_bruteforce"]["shuffledns"]["cooldown"], (int, float)) or values["dns_bruteforce"]["shuffledns"]["cooldown"] < 0:
+    cooldown = values["dns_bruteforce"]["shuffledns"]["cooldown"]
+    if (isinstance(cooldown, bool) or not isinstance(cooldown, (int, float))
+            or not math.isfinite(cooldown) or cooldown < 0):
         raise ValueError("dns_bruteforce.shuffledns.cooldown must be a non-negative number")
     positive(values["telegram"]["batch_size"], "telegram.batch_size", True)
     positive(values["telegram"]["send_delay"], "telegram.send_delay")

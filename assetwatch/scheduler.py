@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+import math
 import signal
 import time
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .notifications import Notifier
@@ -34,40 +35,6 @@ def daemon_lock(path):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-class ScanGate:
-    """Ordinary scans may overlap; brute force waits for exclusive access."""
-
-    def __init__(self):
-        self.condition = asyncio.Condition()
-        self.active = 0
-        self.exclusive = False
-        self.waiting_exclusive = 0
-
-    @asynccontextmanager
-    async def slot(self, exclusive=False):
-        async with self.condition:
-            if exclusive:
-                self.waiting_exclusive += 1
-                try:
-                    await self.condition.wait_for(lambda: not self.exclusive and self.active == 0)
-                    self.exclusive = True
-                finally:
-                    self.waiting_exclusive -= 1
-            else:
-                # Once brute force is queued, let existing scans drain before admitting more.
-                await self.condition.wait_for(lambda: not self.exclusive and self.waiting_exclusive == 0)
-                self.active += 1
-        try:
-            yield
-        finally:
-            async with self.condition:
-                if exclusive:
-                    self.exclusive = False
-                else:
-                    self.active -= 1
-                self.condition.notify_all()
-
-
 class Scheduler:
     def __init__(self, config, database, watchers=None, notifier=None):
         self.config, self.db = config, database
@@ -76,8 +43,6 @@ class Scheduler:
         self.watchers = watchers or Watchers(config, database)
         self.notifier = notifier or Notifier(config, database)
         self.programs = ProgramWatcher(config, database)
-        self.scans = ScanGate()
-        self.bruteforce_lock = asyncio.Lock()
 
     async def watch(self, name):
         interval = self.config["intervals"][name]
@@ -90,24 +55,23 @@ class Scheduler:
                         if target["id"] not in announced:
                             next_run = self.db.next_run_at(target["id"], name, interval, retry_interval)
                             LOG.info("watcher=%s target=%s state=scheduled next_run=%s",
-                                     name, target["name"], datetime.fromtimestamp(next_run, timezone.utc).isoformat())
+                                     name, target["name"], self.display_time(next_run))
                             announced.add(target["id"])
                         continue
                     LOG.info("watcher=%s target=%s state=queued", name, target["name"])
                     self.db.watcher_state(target["id"], name, "queued",
-                                          "Waiting for active scans to drain" if name == "dns_bruteforce"
-                                          else "Waiting for brute-force scan access")
+                                          "Waiting for bounded tool queue")
                     success = False
                     try:
-                        async with (self.bruteforce_lock if name == "dns_bruteforce" else nullcontext()):
-                            async with self.scans.slot(exclusive=name == "dns_bruteforce"):
-                                self.db.consume_run_request(target["id"], name)
-                                self.db.watcher_state(target["id"], name, "running", "Started")
-                                LOG.info("watcher=%s target=%s state=started", name, target["name"])
-                                success = await getattr(self.watchers, name)(target)
+                        self.db.consume_run_request(target["id"], name)
+                        self.db.watcher_state(target["id"], name, "running", "Started; tools use the shared queue")
+                        LOG.info("watcher=%s target=%s state=started", name, target["name"])
+                        options = {"queued_only": True} if name in {"dns_resolution", "http_probe"} else {}
+                        success = await getattr(self.watchers, name)(target, **options)
                     except asyncio.CancelledError:
                         self.db.watcher_state(target["id"], name, "interrupted", "Daemon stopped; run will be retried")
-                        self.db.request_run(target["id"], name)
+                        if name not in {"dns_resolution", "http_probe"}:
+                            self.db.request_run(target["id"], name)
                         raise
                     except Exception as error:
                         reason = redact(self.config, str(error))[:1000]
@@ -116,11 +80,15 @@ class Scheduler:
                     self.db.finished(target["id"], name, bool(success))
                     next_run = self.db.next_run_at(target["id"], name, interval, retry_interval)
                     LOG.info("watcher=%s target=%s state=finished success=%s next_run=%s",
-                             name, target["name"], success, datetime.fromtimestamp(next_run, timezone.utc).isoformat())
+                             name, target["name"], success, self.display_time(next_run))
                     announced.add(target["id"])
             except Exception as error:
                 LOG.error("watcher=%s scheduler_error=%s", name, error)
             await asyncio.sleep(self.config["runtime"]["poll_interval"])
+
+    @staticmethod
+    def display_time(timestamp):
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat() if math.isfinite(timestamp) else "waiting_for_assets"
 
     async def monitoring(self):
         while True:
@@ -150,7 +118,8 @@ class Scheduler:
         stop = stop or asyncio.Event()
         loop = asyncio.get_running_loop()
         for row in self.db.connection.execute("SELECT target_id,watcher FROM watcher_status WHERE state IN ('running','queued','interrupted')"):
-            self.db.request_run(row["target_id"], row["watcher"])
+            if row["watcher"] not in {"dns_resolution", "http_probe"}:
+                self.db.request_run(row["target_id"], row["watcher"])
             self.db.watcher_state(row["target_id"], row["watcher"], "interrupted", "Previous run interrupted; retry queued")
         if own_signals:
             for sig in (signal.SIGINT, signal.SIGTERM):

@@ -64,6 +64,9 @@ def text_lines(path: Path):
 class ToolRunner:
     def __init__(self, config):
         self.config = config
+        # One FIFO slot shared by every watcher, released between tool batches.
+        # Waiting tasks hold only their bounded input, never one task per asset.
+        self.slot = asyncio.Lock()
 
     async def stop_process(self, process):
         # Kill the process group too: ShuffleDNS starts MassDNS children.
@@ -88,6 +91,14 @@ class ToolRunner:
     @asynccontextmanager
     async def run(self, name: str, args: list[str], input_path: Path | None = None, *,
                   merge_stderr=False, env=None, context=""):
+        LOG.info("tool=%s %s state=queued", name, context)
+        async with self.slot:
+            async with self.execute(name, args, input_path, merge_stderr=merge_stderr,
+                                    env=env, context=context) as output:
+                yield output
+
+    @asynccontextmanager
+    async def execute(self, name, args, input_path=None, *, merge_stderr=False, env=None, context=""):
         command = [self.config["tools"][name], *args]
         with tempfile.TemporaryDirectory(prefix="assetwatch-tool-") as directory:
             output, errors = Path(directory) / "stdout", Path(directory) / "stderr"
@@ -151,8 +162,9 @@ class Tools:
             query = urllib.parse.urlencode({"q": "%." + domain, "output": "json"})
             # crt.sh exposes an HTTP JSON endpoint, not an official executable.
             try:
-                records = await asyncio.to_thread(read_json, "https://crt.sh/?" + query,
-                                                  self.config["runtime"]["request_timeout"])
+                async with self.runner.slot:
+                    records = await asyncio.to_thread(read_json, "https://crt.sh/?" + query,
+                                                      self.config["runtime"]["request_timeout"])
             except (OSError, ValueError) as error:
                 raise ToolError(f"crtsh: request failed ({type(error).__name__})") from error
             if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
@@ -210,7 +222,8 @@ class Tools:
             inputs = Path(directory) / "hosts.txt"
             inputs.write_text("\n".join(hostnames) + "\n", encoding="utf-8")
             args = ["-" + record, "-json", "-silent", "-duc", "-rcode", "noerror,nxdomain,servfail,refused",
-                    "-t", str(self.config["runtime"]["threads"])]
+                    "-t", str(self.config["runtime"]["threads"]),
+                    "-rl", str(self.config["runtime"]["dns_rate_limit"])]
             async with self.runner.run("dnsx", args, inputs) as path:
                 results, requested = {}, set(hostnames)
                 for row in json_lines(path):
@@ -227,6 +240,13 @@ class Tools:
                     if not isinstance(values, list):
                         raise ToolError(f"dnsx: invalid {record} record list")
                     if record == "a":
+                        try:
+                            for value in values:
+                                if not isinstance(value, str):
+                                    raise ValueError("Non-string address")
+                                ipaddress.ip_address(value)
+                        except ValueError as error:
+                            raise ToolError("dnsx: malformed A record; previous state preserved") from error
                         values = ipv4_addresses(values) if status == "NOERROR" else []
                     else:
                         normalized = [normalize_hostname(value) for value in values]
@@ -246,7 +266,8 @@ class Tools:
             inputs = Path(directory) / "addresses.txt"
             inputs.write_text("\n".join(sorted(set(addresses))) + "\n", encoding="utf-8")
             args = ["-ptr", "-resp-only", "-silent", "-duc", "-stream",
-                    "-t", str(self.config["runtime"]["threads"])]
+                    "-t", str(self.config["runtime"]["threads"]),
+                    "-rl", str(self.config["runtime"]["dns_rate_limit"])]
             async with self.runner.run("dnsx", args, inputs, context="record=ptr") as path:
                 yield text_lines(path)
 
@@ -255,7 +276,9 @@ class Tools:
             inputs = Path(directory) / "hosts.txt"
             inputs.write_text("\n".join(hostnames) + "\n", encoding="utf-8")
             args = ["-json", "-silent", "-duc", "-sc", "-title", "-server", "-ip", "-probe", "-auto-referer",
-                    "-t", str(self.config["runtime"]["threads"])]
+                    "-tech-detect", "-t", str(self.config["runtime"]["threads"]),
+                    "-rl", str(self.config["runtime"]["http_rate_limit"]),
+                    "-rstr", str(self.config["runtime"]["http_max_response_bytes"])]
             async with self.runner.run("httpx", args, inputs) as path:
                 requested, results = set(hostnames), {}
                 for row in json_lines(path):
@@ -275,7 +298,7 @@ class Tools:
                         if parsed_url.scheme not in {"http", "https"} or normalize_hostname(parsed_url.hostname) != host:
                             raise ToolError("httpx: invalid result URL")
                         observation = {key: row[key] for key in
-                                       ("status_code", "url", "title", "webserver", "content_type", "content_length", "host", "a")
+                                       ("status_code", "url", "title", "webserver", "tech", "content_type", "content_length", "host", "a")
                                        if key in row}
                         existing = results.get(host)
                         if not existing or (url.startswith("https://") and not existing["url"].startswith("https://")):
@@ -294,7 +317,7 @@ class Tools:
             raise ToolError(f"ShuffleDNS requires a nonempty resolver file: {resolvers}")
         threads = str(settings["threads"])
         args = ["-d", domain, "-r", str(resolvers), "-m", self.config["tools"]["massdns"],
-                "-t", threads, "-wt", threads, "-silent", "-duc"]
+                "-t", threads, "-wt", threads, "-sw", "-silent", "-duc"]
         if wordlist is not None:
             args += ["-mode", "bruteforce", "-w", str(wordlist)]
         else:

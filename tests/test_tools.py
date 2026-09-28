@@ -47,7 +47,10 @@ class WrapperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed, {"yes.example.test": ["192.0.2.1"], "no.example.test": [], "empty.example.test": []})
 
     async def test_malformed_and_wrong_host_results_reject_batch(self):
-        for rows in (["not JSON"], [{"host": "outside.test", "status_code": "NOERROR"}], [{"host": "example.test", "a": []}]):
+        for rows in (["not JSON"], [{"host": "outside.test", "status_code": "NOERROR"}],
+                     [{"host": "example.test", "a": []}],
+                     [{"host": "example.test", "status_code": "NOERROR", "a": ["not-an-address"]}],
+                     [{"host": "example.test", "status_code": "NOERROR", "a": [42]}]):
             with self.output(rows):
                 with self.assertRaises(ToolError):
                     await self.tools.dns(["example.test"])
@@ -227,11 +230,17 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("-recursive", record["args"])
             if record["tool"] == "httpx":
                 self.assertIn("-auto-referer", record["args"])
+                self.assertIn("-tech-detect", record["args"])
+                self.assertEqual(record["args"][record["args"].index("-rl") + 1], "10")
+                self.assertEqual(record["args"][record["args"].index("-rstr") + 1], "1048576")
+            if record["tool"] == "dnsx":
+                self.assertEqual(record["args"][record["args"].index("-rl") + 1], "50")
             if record["tool"] == "shuffledns":
                 args = record["args"]
                 self.assertEqual(args[args.index("-t") + 1], "10")
                 self.assertEqual(args[args.index("-wt") + 1], "10")
                 self.assertEqual(args[args.index("-m") + 1], self.config["tools"]["massdns"])
+                self.assertIn("-sw", args)
                 self.assertNotIn("outside.invalid", record.get("input", []))
 
     async def test_failed_dns_batch_preserves_state_and_other_batches_continue(self):
@@ -246,9 +255,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             asset.pop("cname_checked_at")
         self.assertEqual(after, before)
 
-    async def test_cname_alerts_include_unresolved_assets_and_ignore_ip_notification_mute(self):
+    async def test_cname_alerts_require_validated_assets_and_ignore_ip_notification_mute(self):
         self.db.ingest(self.target["id"], ["unresolved.example.test"], "subfinder")
         await self.watchers.dns_resolution(self.target)
+        await self.watchers.http_probe(self.target)
         for event in self.db.pending_events(100):
             self.db.notification_result(event["id"])
         self.config["telegram"].update(enabled=True, bot_token="fixture-token", chat_id="123",
@@ -263,11 +273,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         notifier = Notifier(self.config, self.db)
         with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
             await notifier.flush()
-            self.assertEqual(send.call_count, 3)
+            self.assertEqual(send.call_count, 2)
             self.assertTrue(all("DNS CNAME Changed" in call.args[2]["text"] for call in send.call_args_list))
             await self.watchers.dns_resolution(self.target)
             await notifier.flush()
-            self.assertEqual(send.call_count, 3)
+            self.assertEqual(send.call_count, 2)
 
     async def test_bruteforce_logs_progress_and_delivers_each_new_asset_once(self):
         for event in self.db.pending_events(100):
@@ -275,13 +285,20 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.config["telegram"].update(enabled=True, bot_token="test-token", chat_id="123", send_delay=0.001)
         with self.assertLogs("assetwatch.watchers", level="INFO") as logs:
             self.assertTrue(await self.watchers.dns_bruteforce(self.target))
-        for marker in ("mode=static", "tool=dnsgen batch=1", "mode=dynamic", "new_asset_events=", "state=complete success=True"):
+        for marker in ("mode=static", "tool=dnsgen batch=1", "mode=dynamic", "validation=queued", "state=complete success=True"):
             self.assertTrue(any(marker in line for line in logs.output), marker)
         notifier = Notifier(self.config, self.db)
         with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
             await notifier.flush()
+            send.assert_not_called()
+            await self.watchers.dns_resolution(self.target)
+            await notifier.flush()
+            send.assert_not_called()
+            await self.watchers.http_probe(self.target)
+            await notifier.flush()
             self.assertGreater(send.call_count, 0)
-            self.assertTrue(all("DNS-Brute-Force New Asset" in call.args[2]["text"] for call in send.call_args_list))
+            self.assertTrue(all(r"DNS\-Brute\-Force New Asset" in call.args[2]["text"] for call in send.call_args_list))
+            self.assertTrue(all(call.args[2]["parse_mode"] == "MarkdownV2" for call in send.call_args_list))
             sent = send.call_count
             self.assertTrue(await self.watchers.dns_bruteforce(self.target))
             await notifier.flush()

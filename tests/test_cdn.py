@@ -116,6 +116,7 @@ class CdnTests(unittest.IsolatedAsyncioTestCase):
         self.db.add_target("one", ["example.test"], [])
         asset = next(self.db.assets())
         self.db.observe_dns(asset["id"], ["192.0.2.1"])
+        self.db.observe_http(asset["id"], {"status_code": 200}, 1)
         for event in self.db.pending_events(100):
             self.db.notification_result(event["id"])
         for number in (2, 3, 4):
@@ -127,9 +128,10 @@ class CdnTests(unittest.IsolatedAsyncioTestCase):
         with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
             while await notifier.flush():
                 pass
-            self.assertEqual(send.call_count, 3)  # Migration, DNS loss, DNS return.
+            self.assertEqual(send.call_count, 4)  # Migration, DNS loss + HTTP loss, DNS return.
             suppressed = self.db.connection.execute(
-                "SELECT e.*,s.reason FROM events e JOIN notification_suppressions s ON s.event_id=e.id").fetchall()
+                "SELECT e.*,s.reason FROM events e JOIN notification_suppressions s ON s.event_id=e.id "
+                "WHERE s.reason!='initial_validation'").fetchall()
             self.assertEqual(len(suppressed), 3)
             for row in suppressed:
                 self.assertIsNone(row["delivered_at"])
@@ -139,7 +141,7 @@ class CdnTests(unittest.IsolatedAsyncioTestCase):
             self.db.close()
             self.db = Database(self.path / "assets.db")
             self.assertFalse(await Notifier(self.config, self.db).flush())
-            self.assertEqual(send.call_count, 3)
+            self.assertEqual(send.call_count, 4)
         self.assertEqual(next(self.db.assets())["ip_addresses"], ["203.0.113.2"])
         self.assertEqual(self.db.pending_events(100), [])
         self.db.remove_target("one")

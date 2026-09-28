@@ -135,6 +135,9 @@ class DatabaseCase(unittest.TestCase):
             pass
 
     def test_notification_retry_persistence_and_acknowledgement(self):
+        for asset in self.db.assets():
+            self.db.observe_dns(asset["id"], ["192.0.2.1"])
+            self.db.observe_http(asset["id"], {"status_code": 200}, 1)
         self.config["telegram"].update(enabled=True, bot_token="secret-token", chat_id="123", send_delay=0.001)
         notifier = Notifier(self.config, self.db)
         with patch("assetwatch.notifications.read_json", side_effect=OSError("https://secret-token")):
@@ -158,8 +161,9 @@ class DatabaseCase(unittest.TestCase):
             send.assert_not_called()
         event = self.db.pending_events(10)[-1]
         message = format_event(event)
-        self.assertIn("Certificate-derived New Asset", message)
-        self.assertIn("DNS: PENDING", message)
+        self.assertIn(r"Certificate\-derived New Asset", message)
+        self.assertIn("*DNS:* PENDING", message)
+        self.assertEqual(self.db.pending_events(10, validated_only=True), [])
 
     def test_global_ip_mute_is_retained_without_blocking_bruteforce_and_outage_alerts(self):
         self.config["telegram"].update(enabled=True, bot_token="test-token", chat_id="123",
@@ -175,6 +179,9 @@ class DatabaseCase(unittest.TestCase):
         self.assertEqual(self.asset()["ip_addresses"], ["192.0.2.5"])
         self.assertEqual(self.kinds().count("dns_ip_changed"), 4)
         self.db.ingest(self.target["id"], ["new.example.test"], "dns_bruteforce")
+        new = self.asset("new.example.test")
+        self.db.observe_dns(new["id"], ["192.0.2.1"])
+        self.db.observe_http(new["id"], {"status_code": 403}, 1)
         self.db.observe_dns(asset["id"], [])
         # Exercise a pre-existing outbox on restart, including more IP events than a batch.
         self.db.close()
@@ -185,7 +192,7 @@ class DatabaseCase(unittest.TestCase):
             self.assertFalse(asyncio.run(notifier.flush()))
             self.assertEqual(send.call_count, 3)
             messages = [call.args[2]["text"] for call in send.call_args_list]
-            self.assertIn("DNS-Brute-Force New Asset", messages[0])
+            self.assertIn(r"DNS\-Brute\-Force New Asset", messages[0])
             self.assertIn("DNS Unresolved", messages[1])
             self.assertIn("HTTP Service Disappeared", messages[2])
             self.assertEqual({row["event_type"] for row in self.db.pending_events(100)}, {"dns_ip_changed"})
@@ -301,6 +308,9 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(db.close)
             target = db.add_target("one", ["example.test"], [])
             db.ingest(target["id"], ["new.example.test"], "dns_bruteforce")
+            for asset in db.assets():
+                db.observe_dns(asset["id"], ["192.0.2.1"])
+                db.observe_http(asset["id"], {"status_code": 200}, 1)
             scheduler = Scheduler(config, db)
             with patch("assetwatch.notifications.read_json", return_value={"ok": True}) as send:
                 task = asyncio.create_task(scheduler.monitoring())
@@ -323,16 +333,16 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(db.close)
             db.add_target("one", ["one.test"], [])
             db.add_target("two", ["two.test"], [])
+            for asset in db.assets():
+                db.observe_dns(asset["id"], ["192.0.2.1"])
             counts, active, overlaps = {}, set(), []
 
             class FakeWatchers:
                 def __getattr__(self, name):
-                    async def run(target):
+                    async def run(target, **options):
                         key = name, target["name"]
                         if key in active:
                             overlaps.append((key, "duplicate execution"))
-                        if active and (name == "dns_bruteforce" or any(item[0] == "dns_bruteforce" for item in active)):
-                            overlaps.append((key, set(active)))
                         active.add(key)
                         try:
                             counts[key] = counts.get(key, 0) + 1

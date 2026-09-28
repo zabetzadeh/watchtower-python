@@ -8,8 +8,7 @@ from unittest.mock import patch
 
 from assetwatch.config import Config, DEFAULTS
 from assetwatch.database import Database
-from assetwatch.scheduler import ScanGate
-from assetwatch.tools import ToolError
+from assetwatch.tools import ToolError, ToolRunner
 from assetwatch.watchers import Watchers
 
 
@@ -179,6 +178,67 @@ class IncrementalTests(unittest.IsolatedAsyncioTestCase):
         for i in range(7):
             self.assertIn(f"sub{i}.example.test", assets)
 
+    async def test_static_wordlist_is_consumed_lazily_before_first_tool_call(self):
+        directory = self.path / "wordlists"
+        directory.mkdir()
+        wordlist = directory / "words.txt"
+        wordlist.write_text("placeholder")
+        (self.path / "resolvers.txt").write_text("192.0.2.53\n")
+        self.config["dns_bruteforce"]["static"]["chunk_size"] = 3
+        self.config["dns_bruteforce"]["dynamic"]["enabled"] = False
+        consumed = []
+
+        class Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def __iter__(self):
+                for number in range(10):
+                    consumed.append(number)
+                    if number > 2:
+                        raise AssertionError("Read ahead beyond the current chunk")
+                    yield f"sub{number}\n"
+
+        original_open = Path.open
+
+        def open_file(path, *args, **kwargs):
+            return Stream() if path.resolve() == wordlist.resolve() else original_open(path, *args, **kwargs)
+
+        @asynccontextmanager
+        async def shuffledns(*args, **kwargs):
+            self.assertEqual(consumed, [0, 1, 2])
+            raise asyncio.CancelledError
+            yield  # Make this an async context manager without executing any tool.
+
+        with patch.object(Path, "open", open_file), patch.object(self.tools, "shuffledns", shuffledns):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.watchers.dns_bruteforce(self.target)
+
+    async def test_dynamic_chunk_size_limits_tools_and_failed_chunk_does_not_drop_the_rest(self):
+        self.config["dns_bruteforce"]["dynamic"]["chunk_size"] = 2
+        self.config["dns_bruteforce"]["shuffledns"]["cooldown"] = 0
+        self.db.ingest(self.target["id"], [f"sub{i}.example.test" for i in range(6)], "subfinder")
+        calls = []
+
+        @asynccontextmanager
+        async def shuffledns(domain, *, candidates):
+            names = candidates.read_text().splitlines()
+            calls.append(names)
+            self.assertLessEqual(len(names), 2)
+            if len(calls) == 1:
+                raise ToolError("failed first chunk")
+            yield names
+
+        with patch.object(self.tools, "shuffledns", shuffledns):
+            with self.assertRaises(RuntimeError):
+                await self.watchers.dynamic_bruteforce(self.target)
+        self.assertEqual(sum(map(len, calls)), 8)
+        self.assertEqual(len(list(self.db.assets(source="dns_bruteforce"))), 7)
+        self.assertEqual(self.db.pending_events(100, validated_only=True), [])
+
     async def test_target_management_cidr_and_domain(self):
         # Target with only CIDR
         cidr_target = self.db.add_target("cidr_only", [], ["10.0.0.0/24"])
@@ -195,59 +255,60 @@ class IncrementalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(updated["cidrs"]), ["10.0.0.0/24", "10.1.0.0/24"])
 
 
-class ScanGateTests(unittest.IsolatedAsyncioTestCase):
-    async def test_bruteforce_drains_active_jobs_blocks_new_jobs_and_releases_on_cancel(self):
-        gate = ScanGate()
-        brute_queued, brute_started, normal_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+class ToolQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fifo_queue_yields_between_bruteforce_chunks(self):
+        runner = ToolRunner(None)
+        calls = []
+        first_started, release = asyncio.Event(), asyncio.Event()
 
-        async def brute():
-            brute_queued.set()
-            async with gate.slot(exclusive=True):
-                brute_started.set()
-                await asyncio.Event().wait()
+        @asynccontextmanager
+        async def execute(name, *args, **kwargs):
+            calls.append(name)
+            if len(calls) == 1:
+                first_started.set()
+                await release.wait()
+            yield Path("unused")
 
-        async def normal():
-            async with gate.slot():
-                normal_started.set()
+        async def chunks():
+            for _ in range(2):
+                async with runner.run("shuffledns", []):
+                    pass
 
-        async with gate.slot():
-            brute_task = asyncio.create_task(brute())
-            await brute_queued.wait()
-            normal_task = asyncio.create_task(normal())
+        async def dns():
+            async with runner.run("dnsx", []):
+                pass
+
+        with patch.object(runner, "execute", execute):
+            brute = asyncio.create_task(chunks())
+            await first_started.wait()
+            normal = asyncio.create_task(dns())
             await asyncio.sleep(0)
-            self.assertFalse(brute_started.is_set())
-            self.assertFalse(normal_started.is_set())
-        try:
-            await asyncio.wait_for(brute_started.wait(), 1)
-            self.assertFalse(normal_started.is_set())
-        finally:
-            brute_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await brute_task
-        await asyncio.wait_for(normal_task, 1)
-        self.assertTrue(normal_started.is_set())
+            self.assertEqual(calls, ["shuffledns"])
+            release.set()
+            await asyncio.wait_for(asyncio.gather(brute, normal), 1)
+        self.assertEqual(calls, ["shuffledns", "dnsx", "shuffledns"])
 
-    async def test_cancelled_waiter_does_not_block_other_scans(self):
-        gate = ScanGate()
-        queued, admitted = asyncio.Event(), asyncio.Event()
+    async def test_cancelled_waiter_never_executes_and_releases_queue(self):
+        runner = ToolRunner(None)
+        calls = []
 
-        async def brute():
-            queued.set()
-            async with gate.slot(exclusive=True):
-                self.fail("Brute force overlapped an active scan")
+        @asynccontextmanager
+        async def execute(name, *args, **kwargs):
+            calls.append(name)
+            yield Path("unused")
 
-        async def normal():
-            async with gate.slot():
-                admitted.set()
+        async def run(name):
+            async with runner.run(name, []):
+                pass
 
-        async with gate.slot():
-            brute_task = asyncio.create_task(brute())
-            await queued.wait()
-            normal_task = asyncio.create_task(normal())
-            await asyncio.sleep(0)
-            self.assertFalse(admitted.is_set())
-            brute_task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await brute_task
-            await asyncio.wait_for(normal_task, 1)
-            self.assertTrue(admitted.is_set())
+        with patch.object(runner, "execute", execute):
+            async with runner.slot:
+                cancelled = asyncio.create_task(run("shuffledns"))
+                normal = asyncio.create_task(run("httpx"))
+                await asyncio.sleep(0)
+                cancelled.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await cancelled
+                self.assertEqual(calls, [])
+            await asyncio.wait_for(normal, 1)
+        self.assertEqual(calls, ["httpx"])

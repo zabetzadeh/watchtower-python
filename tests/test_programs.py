@@ -223,7 +223,7 @@ class ProgramAsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
         scheduler = Scheduler(self.config, self.db)
         stop = asyncio.Event()
         with patch("assetwatch.programs.read_json", side_effect=fetch):
-            async with scheduler.scans.slot(exclusive=True):
+            async with scheduler.watchers.tools.runner.slot:
                 task = asyncio.create_task(scheduler.run(stop))
                 try:
                     async with asyncio.timeout(2):
@@ -255,6 +255,9 @@ class ProgramAsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.config["telegram"]["batch_size"] = 2
         target = self.db.add_target("example", ["example.test"], [])
         self.db.ingest(target["id"], ["a.example.test", "b.example.test"], "subfinder")
+        for asset in self.db.assets():
+            self.db.observe_dns(asset["id"], ["192.0.2.1"])
+            self.db.observe_http(asset["id"], {"status_code": 200}, 1)
         self.observe("hackerone", [program("hackerone")])
         self.observe("hackerone", [program("hackerone"), program("hackerone", "new", ["new.test"])])
         with patch("assetwatch.notifications.read_json", return_value={"ok": True, "result": {"message_id": 12}}) as send:
@@ -271,6 +274,9 @@ class ProgramAsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def test_single_message_batches_alternate_queues_without_exceeding_limit(self):
         self.config["telegram"]["batch_size"] = 1
         self.db.add_target("example", ["a.test", "b.test", "c.test"], [])
+        for asset in self.db.assets():
+            self.db.observe_dns(asset["id"], ["192.0.2.1"])
+            self.db.observe_http(asset["id"], {"status_code": 200}, 1)
         self.observe("hackerone", [program("hackerone")])
         self.observe("hackerone", [program("hackerone"), program("hackerone", "new")])
         notifier = Notifier(self.config, self.db)

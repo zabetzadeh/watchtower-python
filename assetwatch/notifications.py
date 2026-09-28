@@ -8,6 +8,7 @@ import urllib.error
 from itertools import zip_longest
 
 from .cdn import CdnRanges
+from .programs import markdown, utf16_length
 from .tools import read_json
 
 LOG = logging.getLogger(__name__)
@@ -24,6 +25,19 @@ TITLES = {
 }
 
 
+def inline(value, maximum=350):
+    # Clip before closing the code entity, never through a Markdown escape.
+    output, size = "", 0
+    for char in " ".join(str(value).split()):
+        escaped = "\\" + char if char in "\\`" else char
+        size += utf16_length(escaped)
+        if size > maximum:
+            output += "…"
+            break
+        output += escaped
+    return "`" + (output or "-") + "`"
+
+
 def format_event(event: dict) -> str:
     before, after = json.loads(event["previous_state"]), json.loads(event["new_state"])
     title = TITLES.get(event["event_type"], event["event_type"])
@@ -31,33 +45,41 @@ def format_event(event: dict) -> str:
         title = {"tlsx": "🆕 Certificate-derived New Asset",
                  "ptr": "🆕 PTR-derived New Asset",
                  "dns_bruteforce": "🆕 DNS-Brute-Force New Asset"}.get(after.get("source"), title)
-    lines = [title, "", f"Target: {event['target']}", f"Subdomain: {event['hostname']}"]
-    if after.get("source"):
-        lines.append(f"Source: {after['source']}")
+    lines = [f"*{markdown(title)}*", "", f"*Target:* {inline(event['target'])}",
+             f"*Host:* {inline(event['hostname'])}"]
+    sources = event.get("sources") or ([after["source"]] if after.get("source") else [])
+    if sources:
+        lines.append(f"*Source:* {inline(', '.join(sources))}")
     if event["event_type"] == "dns_cname_changed":
-        lines += ["Previous: " + (", ".join(before.get("cname_records", [])) or "(none)"),
-                  "Current: " + (", ".join(after.get("cname_records", [])) or "(none)"),
-                  "Review the CNAME change; this is not proof of takeover."]
+        lines += ["*Previous:* " + inline(", ".join(before.get("cname_records", [])) or "(none)"),
+                  "*Current:* " + inline(", ".join(after.get("cname_records", [])) or "(none)")]
     elif event["event_type"] == "http_status_changed":
-        lines.append(f"{before.get('http_status')} → {after.get('http_status')}")
-    else:
-        dns = "RESOLVED" if after.get("dns_resolved") else "UNRESOLVED"
-        if not after.get("dns_checked_at"):
-            dns = "PENDING"
-        http = "YES" if after.get("http_available") else "NO"
-        if not after.get("http_checked_at"):
-            http = "PENDING"
-        lines += [f"DNS: {dns}", "IP: " + (", ".join(after.get("ip_addresses", [])) or "-"),
-                  f"HTTP: {http}", f"Status: {after.get('http_status') or '-'}"]
-        if event["event_type"] == "dns_ip_changed":
-            new_ips = sorted(set(after.get("ip_addresses", [])) -
-                             set(before.get("known_ip_addresses", before.get("ip_addresses", []))))
-            lines.append("New IPs: " + ", ".join(new_ips))
-            lines.append("Known IP pool: " + ", ".join(after.get("known_ip_addresses", after.get("ip_addresses", []))))
+        lines.append(f"*Status:* {inline(before.get('http_status'))} → {inline(after.get('http_status'))}")
+    dns = "RESOLVED" if after.get("dns_resolved") else "UNRESOLVED"
+    http = "LIVE" if after.get("http_available") else "DOWN"
+    if not after.get("dns_checked_at"):
+        dns = "PENDING"
+    if not after.get("http_checked_at"):
+        http = "PENDING"
+    lines += ["", f"*DNS:* {dns} • *HTTP:* {http}",
+              "*IP:* " + inline(", ".join(after.get("ip_addresses", [])) or "-"),
+              f"*HTTP status:* {inline(after.get('http_status') or '-')}"]
+    if event["event_type"] == "dns_ip_changed":
+        new_ips = sorted(set(after.get("ip_addresses", [])) -
+                         set(before.get("known_ip_addresses", before.get("ip_addresses", []))))
+        lines.append("*New IPs:* " + inline(", ".join(new_ips)))
+    metadata = after.get("http_metadata", {})
+    for label, key in (("Title", "title"), ("Server", "webserver"), ("Technology", "tech")):
+        value = metadata.get(key)
+        if value:
+            lines.append(f"*{label}:* {inline(', '.join(map(str, value)) if isinstance(value, list) else value)}")
     if after.get("http_url"):
-        lines.append(f"URL: {after['http_url']}")
-    lines += [f"Time: {event['created_at']}", f"Event: {event['id']}"]
-    return "\n".join(lines)[:4000]
+        lines.append(f"*URL:* {inline(after['http_url'], 500)}")
+    observed = after.get("http_checked_at") if event["event_type"] == "fresh_asset" else event["created_at"]
+    footer = ["", f"*Observed:* {inline(observed or event['created_at'])}", f"*Event:* {inline(event['id'])}"]
+    while utf16_length("\n".join(lines + footer)) > 3900:
+        lines.pop()
+    return "\n".join(lines + footer)
 
 
 class Notifier:
@@ -72,7 +94,7 @@ class Notifier:
             self.db.set_runtime("delivery", {"state": "disabled", "checked_at": time.time()})
             return False
         excluded = () if settings["notify_dns_ip_changes"] else ("dns_ip_changed",)
-        asset_events = self.db.pending_events(settings["batch_size"], exclude_types=excluded)
+        asset_events = self.db.pending_events(settings["batch_size"], exclude_types=excluded, validated_only=True)
         program_messages = self.db.pending_program_messages(settings["batch_size"])
         # Alternate queues so a large asset backlog cannot hide program additions.
         queues = (program_messages, asset_events) if self.program_first else (asset_events, program_messages)
@@ -100,6 +122,7 @@ class Notifier:
             retry_after = self.config["intervals"]["monitoring"]
             try:
                 payload = {"chat_id": settings["chat_id"], "text": event["text"] if program else format_event(event),
+                           "parse_mode": "MarkdownV2",
                            "link_preview_options": {"is_disabled": True}}
                 if program:
                     payload.update(parse_mode="MarkdownV2", reply_markup={"inline_keyboard": [[
