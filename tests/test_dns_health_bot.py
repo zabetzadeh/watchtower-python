@@ -228,7 +228,8 @@ class AsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
              patch.object(tools, "cnames", AsyncMock(side_effect=lambda names: {n: [] for n in names})), \
              patch.object(tools, "http", AsyncMock(side_effect=lambda names: {n: {"status_code": 200, "url": "https://" + n} for n in names})):
             await watchers.dns_resolution(self.target)
-            await watchers.http_probe(self.target)
+            for _ in range(self.config["verification"]["http_confirmations"]):
+                await watchers.http_probe(self.target)
         self.assertTrue(all(a["http_available"] for a in self.db.assets(source="ptr")))
         second = self.db.add_target("two", ["other.test"], ["192.0.2.0/24"])
         with patch.object(tools.runner, "run", run):

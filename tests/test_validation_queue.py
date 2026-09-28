@@ -47,6 +47,9 @@ class ValidationQueueTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
         self.config = Config(copy.deepcopy(DEFAULTS), self.path)
+        # Keep queue/validation fixtures single-step; verification has its own
+        # default-threshold integration regressions.
+        self.config["verification"].update(http_confirmations=1, dns_loss_confirmations=1)
         self.config["runtime"].update(batch_size=2, poll_interval=0.001)
         self.config["telegram"].update(enabled=True, bot_token="fixture", chat_id="123", send_delay=0.001)
         self.config["cdn"]["enabled"] = False

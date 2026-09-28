@@ -61,13 +61,16 @@ def format_event(event: dict) -> str:
         dns = "PENDING"
     if not after.get("http_checked_at"):
         http = "PENDING"
-    lines += ["", f"*DNS:* {dns} • *HTTP:* {http}",
-              "*IP:* " + inline(", ".join(after.get("ip_addresses", [])) or "-"),
-              f"*HTTP status:* {inline(after.get('http_status') or '-')}"]
+    lines += ["", f"*DNS:* {dns} • *HTTP:* {http}"]
     if event["event_type"] == "dns_ip_changed":
         new_ips = sorted(set(after.get("ip_addresses", [])) -
                          set(before.get("known_ip_addresses", before.get("ip_addresses", []))))
-        lines.append("*New IPs:* " + inline(", ".join(new_ips)))
+        lines += ["*Previous IPs:* " + inline(", ".join(before.get("ip_addresses", [])) or "-"),
+                  "*Current IPs:* " + inline(", ".join(after.get("ip_addresses", [])) or "-"),
+                  "*New IPs:* " + inline(", ".join(new_ips))]
+    else:
+        lines.append("*IP:* " + inline(", ".join(after.get("ip_addresses", [])) or "-"))
+    lines.append(f"*HTTP status:* {inline(after.get('http_status') or '-')}")
     metadata = after.get("http_metadata", {})
     for label, key in (("Title", "title"), ("Server", "webserver"), ("Technology", "tech")):
         value = metadata.get(key)

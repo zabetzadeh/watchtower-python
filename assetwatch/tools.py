@@ -276,6 +276,7 @@ class Tools:
             inputs = Path(directory) / "hosts.txt"
             inputs.write_text("\n".join(hostnames) + "\n", encoding="utf-8")
             args = ["-json", "-silent", "-duc", "-sc", "-title", "-server", "-ip", "-probe", "-auto-referer",
+                    "-random-agent=false", "-H", "User-Agent: assetwatch/0.1",
                     "-tech-detect", "-t", str(self.config["runtime"]["threads"]),
                     "-rl", str(self.config["runtime"]["http_rate_limit"]),
                     "-rstr", str(self.config["runtime"]["http_max_response_bytes"])]

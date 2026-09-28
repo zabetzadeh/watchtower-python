@@ -321,15 +321,42 @@ cannot block eligible notifications. Validation and delivery survive restarts, a
 old databases recover validation from their first recorded live HTTP observation.
 
 Unchanged observations generate no new event. A later repeat of a real transition
-(200 → 403 → 200 → 403) creates a new event for each occurrence.
+(200 → 403 → 200 → 403) creates a new event for each confirmed occurrence.
+
+HTTP appearances, returns, disappearances and status/URL changes require **three
+consecutive matching observations** by default. This includes the initial live
+baseline: a stray initial 200 followed by steady 403 responses does not create a
+false 200 → 403 alert. Pending changes leave the last confirmed state and timestamps
+intact. Only pending assets are scheduled for an early recheck through the same
+bounded tool queue; no extra workers or per-host tasks are started.
+
+```yaml
+verification:
+  http_confirmations: 3
+  dns_loss_confirmations: 3
+  retry_interval: 30  # Seconds between verification checks
+```
+
+The first observation counts toward the threshold. Three confirmations normally
+add at least two recheck intervals, plus scan/queue time, before an alert. Rechecks
+use the shorter of this delay and the normal scan interval. A different result
+resets the candidate; a return to the confirmed state cancels it. Failed tools,
+malformed output and missing results break the confirmation sequence and use the
+normal failure retry interval. Candidates and per-asset deadlines survive restarts.
+Confirmed DNS/IP changes invalidate HTTP candidates and in-flight HTTP results.
+Setting a confirmation count to 1 restores immediate acceptance for that type.
+These checks reduce transient noise; a response that stays wrong throughout all
+confirmation checks can still be accepted. Existing history is retained.
 
 A-record observations are normalized, deduplicated and compared as sets; multiple
 DNSX rows for the same hostname are merged. The database remembers all previously
 seen IPs per asset across restarts. **A newly seen IP can notify; rotation among
 known IPs, response reordering, and a nonempty subset of a known pool do not.**
 Removing only part of a pool updates current state without an IP alert; a completely
-empty conclusive A response still generates the normal DNS-loss event. Historical
+empty A response generates the normal DNS-loss event after confirmation. Historical
 IPs are never used to authorize an HTTP probe when the current A set is empty.
+DNS IP alerts show the previous observed IPs, current IPs and newly seen IPs.
+Long address lists are clipped in Telegram; full sets remain in SQLite/event JSON.
 
 New-IP events **notify by default, except known CDN address rotation**. The filter compares the old and new IP sets against downloaded provider
 CIDRs. It skips an alert only when every added/removed address is a known CDN IP
@@ -385,11 +412,15 @@ queued. Back up and stop the old daemon before upgrading, then restart the new c
 
 DNSX uses explicit NOERROR/NXDOMAIN observations. SERVFAIL, REFUSED, omitted results,
 failed executables, timeouts and malformed output preserve previous state. HTTPX
-uses explicit probe failures to mark a service unavailable; missing rows are
-inconclusive. DNS loss marks any active HTTP service down without probing. Results
+requires repeated explicit probe failures to mark a service unavailable; missing rows are
+inconclusive. Confirmed DNS loss marks any active HTTP service down without probing. Results
 from an HTTP batch are discarded if its DNS state or IP set changed in flight.
 HTTPX uses its default HTTPS-first/HTTP-fallback behavior, does not follow redirects,
 and records one representative HTTP service per hostname (not every port/scheme).
+Status-change alerts compare the same URL: switching between HTTP and HTTPS updates
+the representative service after confirmation without claiming its status changed.
+Requests use a fixed `User-Agent: assetwatch/0.1` with random agents disabled, so
+varying request identity does not itself cause alternating WAF responses.
 Every HTTP check includes `-tech-detect` and refreshes the stored fingerprint, even
 when the status stays unchanged. `runtime.dns_rate_limit` (default 50) caps DNSX
 queries/second and `runtime.http_rate_limit` (default 10) caps HTTPX requests/second.

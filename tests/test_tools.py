@@ -175,6 +175,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
         self.config = Config(copy.deepcopy(DEFAULTS), self.path)
+        # These fixtures exercise tool integration; default verification is
+        # exercised separately with transient and repeated observations.
+        self.config["verification"].update(http_confirmations=1, dns_loss_confirmations=1)
         self.config["runtime"]["batch_size"] = 3
         self.phase, self.calls = self.path / "phase", self.path / "calls.jsonl"
         self.phase.write_text("0")
@@ -230,6 +233,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("-recursive", record["args"])
             if record["tool"] == "httpx":
                 self.assertIn("-auto-referer", record["args"])
+                self.assertIn("-random-agent=false", record["args"])
+                self.assertIn("User-Agent: assetwatch/0.1", record["args"])
                 self.assertIn("-tech-detect", record["args"])
                 self.assertEqual(record["args"][record["args"].index("-rl") + 1], "10")
                 self.assertEqual(record["args"][record["args"].index("-rstr") + 1], "1048576")

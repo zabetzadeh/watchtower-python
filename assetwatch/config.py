@@ -27,6 +27,8 @@ DEFAULTS = {
                 "request_timeout": 30, "threads": 10, "poll_interval": 1,
                 "dns_rate_limit": 50, "http_rate_limit": 10, "http_max_response_bytes": 1048576,
                 "progress_interval": 30, "failure_retry_interval": 300},
+    "verification": {"http_confirmations": 3, "dns_loss_confirmations": 3,
+                     "retry_interval": 30},
     "chaos": {"api_key": ""},
     "cdn": {"enabled": True, "refresh_interval": 86400, "retry_interval": 3600,
             "max_age": 604800,
@@ -102,6 +104,8 @@ def load_config(filename: str | Path = "config.yaml") -> Config:
     for name, value in values["runtime"].items():
         positive(value, f"runtime.{name}", name in {"batch_size", "threads", "dns_rate_limit",
                                                   "http_rate_limit", "http_max_response_bytes"})
+    for name, value in values["verification"].items():
+        positive(value, f"verification.{name}", name.endswith("confirmations"))
     for section in (values["telegram"], values["cdn"], values["program_watch"], values["dns_bruteforce"]["static"],
                     values["dns_bruteforce"]["dynamic"]):
         if not isinstance(section["enabled"], bool):

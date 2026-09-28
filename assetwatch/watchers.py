@@ -97,22 +97,33 @@ class Watchers:
         success = True
         for batch in self.db.asset_batches(target["id"], self.config["runtime"]["batch_size"],
                                           due_watcher="dns_resolution" if queued_only else None):
-            observations, cnames = {}, {}
+            observations, cnames, pending = {}, {}, set()
             try:
                 observations = await self.tools.dns([asset["hostname"] for asset in batch])
                 for asset in batch:
                     if asset["hostname"] in observations:
-                        self.db.observe_dns(asset["id"], observations[asset["hostname"]])
-                LOG.info("target=%s watcher=dns_resolution checked=%s resolved=%s inconclusive=%s",
+                        accepted = self.db.observe_dns(
+                            asset["id"], observations[asset["hostname"]],
+                            loss_confirmations=self.config["verification"]["dns_loss_confirmations"])
+                        if accepted is None:
+                            pending.add(asset["id"])
+                    else:
+                        self.db.reset_confirmation(asset["id"], "dns_resolution")
+                LOG.info("target=%s watcher=dns_resolution checked=%s resolved=%s inconclusive=%s pending=%s",
                          target["name"], len(batch), sum(bool(ips) for ips in observations.values()),
-                         len(batch) - len(observations))
-                self.db.watcher_progress(target["id"], "dns_resolution", f"A records: checked={len(batch)}",
+                         len(batch) - len(observations), len(pending))
+                self.db.watcher_progress(target["id"], "dns_resolution",
+                                         f"A records: checked={len(batch)} pending_verification={len(pending)}",
                                          results=len(observations))
                 if len(observations) < len(batch):
                     success = False
                     self.error(target, "dns_resolution", "Inconclusive A responses; previous state preserved")
             except Exception as error:
                 success = False
+                observations = {}
+                pending.clear()
+                for asset in batch:
+                    self.db.reset_confirmation(asset["id"], "dns_resolution")
                 self.error(target, "dns_resolution", error)
                 LOG.error("target=%s watcher=dns_resolution error=%s state_preserved=true", target["name"], error)
             try:
@@ -131,6 +142,8 @@ class Watchers:
                 LOG.error("target=%s watcher=dns_resolution record=cname error=%s state_preserved=true", target["name"], error)
             for asset in batch:
                 delay = self.config["intervals"]["dns_resolution"]
+                if asset["id"] in pending:
+                    delay = min(delay, self.config["verification"]["retry_interval"])
                 if asset["hostname"] not in observations or asset["hostname"] not in cnames:
                     delay = min(delay, self.config["runtime"]["failure_retry_interval"])
                 self.db.schedule_check(asset["id"], "dns_resolution", delay)
@@ -140,27 +153,42 @@ class Watchers:
         success = True
         for batch in self.db.asset_batches(target["id"], self.config["runtime"]["batch_size"], resolved_only=True,
                                           due_watcher="http_probe" if queued_only else None):
-            observed = set()
+            observed, pending = set(), set()
             try:
                 observations = await self.tools.http([asset["hostname"] for asset in batch])
                 for asset in batch:
                     if asset["hostname"] in observations:
-                        if self.db.observe_http(asset["id"], observations[asset["hostname"]], asset["dns_version"]):
+                        accepted = self.db.observe_http(
+                            asset["id"], observations[asset["hostname"]], asset["dns_version"],
+                            confirmations=self.config["verification"]["http_confirmations"])
+                        if accepted:
                             observed.add(asset["id"])
-                LOG.info("target=%s watcher=http_probe checked=%s available=%s inconclusive=%s",
+                        elif accepted is None:
+                            pending.add(asset["id"])
+                    else:
+                        self.db.reset_confirmation(asset["id"], "http_probe")
+                LOG.info("target=%s watcher=http_probe checked=%s available=%s inconclusive=%s pending=%s",
                          target["name"], len(batch), sum(asset["id"] in observed and observations[asset["hostname"]] is not None
-                                                        for asset in batch), len(batch) - len(observed))
-                self.db.watcher_progress(target["id"], "http_probe", f"HTTP checked={len(batch)}", results=len(observed))
-                if len(observed) < len(batch):
+                                                        for asset in batch),
+                         len(batch) - len(observed) - len(pending), len(pending))
+                self.db.watcher_progress(target["id"], "http_probe",
+                                         f"HTTP checked={len(batch)} pending_verification={len(pending)}",
+                                         results=len(observed))
+                if len(observed) + len(pending) < len(batch):
                     success = False
                     self.error(target, "http_probe", "Inconclusive or stale HTTP responses; previous state preserved")
             except Exception as error:
                 success = False
+                pending.clear()
+                for asset in batch:
+                    self.db.reset_confirmation(asset["id"], "http_probe")
                 self.error(target, "http_probe", error)
                 LOG.error("target=%s watcher=http_probe error=%s state_preserved=true", target["name"], error)
             for asset in batch:
                 delay = self.config["intervals"]["http_probe"]
-                if asset["id"] not in observed:
+                if asset["id"] in pending:
+                    delay = min(delay, self.config["verification"]["retry_interval"])
+                elif asset["id"] not in observed:
                     delay = min(delay, self.config["runtime"]["failure_retry_interval"])
                 self.db.schedule_check(asset["id"], "http_probe", delay)
         return success

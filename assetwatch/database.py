@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS monitoring_jobs (
     PRIMARY KEY(asset_id, watcher)
 );
 CREATE INDEX IF NOT EXISTS idx_monitoring_due ON monitoring_jobs(watcher, due_at, asset_id);
+CREATE TABLE IF NOT EXISTS observation_confirmations (
+    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    watcher TEXT NOT NULL, state TEXT NOT NULL, samples INTEGER NOT NULL,
+    PRIMARY KEY(asset_id, watcher)
+);
 CREATE TABLE IF NOT EXISTS asset_validations (
     asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
     event_id INTEGER NOT NULL, state TEXT NOT NULL
@@ -437,15 +442,46 @@ class Database:
             last = rows[-1][0]
             yield [row[0] for row in rows]
 
-    def observe_dns(self, asset_id: int, addresses: list[str]):
+    def reset_confirmation(self, asset_id: int, watcher: str):
+        self.connection.execute("DELETE FROM observation_confirmations WHERE asset_id=? AND watcher=?",
+                                (asset_id, watcher))
+
+    def _confirm_observation(self, asset_id, watcher, state, required):
+        # Called within the observation's transaction: pending evidence, accepted
+        # state and events must never get out of sync after a crash.
+        encoded = json.dumps(state, sort_keys=True)
+        row = self.connection.execute(
+            "SELECT state,samples FROM observation_confirmations WHERE asset_id=? AND watcher=?",
+            (asset_id, watcher)).fetchone()
+        samples = row["samples"] + 1 if row and row["state"] == encoded else 1
+        if samples >= required:
+            self.reset_confirmation(asset_id, watcher)
+            return True
+        self.connection.execute(
+            "INSERT INTO observation_confirmations VALUES (?,?,?,?) "
+            "ON CONFLICT(asset_id,watcher) DO UPDATE SET state=excluded.state,samples=excluded.samples",
+            (asset_id, watcher, encoded, samples))
+        LOG.info("asset_id=%s watcher=%s verification=pending samples=%s required=%s state=%s",
+                 asset_id, watcher, samples, required, encoded)
+        return False
+
+    def observe_dns(self, asset_id: int, addresses: list[str], *, loss_confirmations=1):
+        """Apply DNS evidence; return None while a loss awaits confirmation."""
         addresses = ipv4_addresses(addresses)
         with self.transaction():
             row = self.connection.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
             if row is None:
-                return
+                return False
             before = decode_asset(row)
+            if not addresses and before["dns_resolved"]:
+                if not self._confirm_observation(asset_id, "dns_resolution", [], loss_confirmations):
+                    return None
+            else:
+                self.reset_confirmation(asset_id, "dns_resolution")
             now = utcnow()
             changed = before["ip_addresses"] != addresses
+            if changed:
+                self.reset_confirmation(asset_id, "http_probe")
             known = sorted(set(before["known_ip_addresses"]) | set(addresses))
             after = {**before, "dns_resolved": bool(addresses), "ip_addresses": addresses,
                      "known_ip_addresses": known,
@@ -472,6 +508,7 @@ class Database:
                                         (asset_id,))
             for kind in kinds:
                 self._event(asset_id, kind, before, after)
+            return True
 
     def observe_cnames(self, asset_id: int, names: list[str]):
         records = sorted({name for raw in names if (name := normalize_hostname(raw))})
@@ -494,7 +531,12 @@ class Database:
         while rows := cursor.fetchmany(size):
             yield [row[0] for row in rows]
 
-    def observe_http(self, asset_id: int, observation: dict | None, dns_version: int):
+    def observe_http(self, asset_id: int, observation: dict | None, dns_version: int, *, confirmations=1):
+        """Apply verified evidence; True=accepted, None=pending, False=stale.
+
+        Direct callers may submit already verified evidence (one sample); the
+        watcher supplies the configured confirmation threshold on every check.
+        """
         with self.transaction():
             row = self.connection.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
             if row is None or not row["dns_resolved"] or row["dns_version"] != dns_version:
@@ -503,6 +545,15 @@ class Database:
             status = observation["status_code"] if observation else None
             if status is not None and (type(status) is not int or not 100 <= status <= 599):
                 raise ValueError("Invalid HTTP status code")
+            url = observation.get("url") if observation else before["http_url"]
+            changed = (status != before["http_status"] or
+                       (status is not None and url != before["http_url"]))
+            if changed:
+                state = {"status": status, "url": url, "dns_version": dns_version}
+                if not self._confirm_observation(asset_id, "http_probe", state, confirmations):
+                    return None
+            else:
+                self.reset_confirmation(asset_id, "http_probe")
             now = utcnow()
             previous_status = (before["http_status"] if before["http_status"] != status
                                and before["http_status"] is not None else before["previous_http_status"])
@@ -513,14 +564,14 @@ class Database:
                      "previous_http_status": previous_status,
                      "http_ever_available": before["http_ever_available"] or status is not None,
                      "http_checked_at": now, "http_down_since": down_since,
-                     "http_url": observation.get("url") if observation else before["http_url"],
+                     "http_url": url,
                      "http_metadata": observation or {"reason": "probe_unavailable"}}
             self.connection.execute(
                 "UPDATE assets SET http_available=?,http_status=?,previous_http_status=?,http_ever_available=?,"
                 "http_checked_at=?,http_down_since=?,http_url=?,http_metadata=? WHERE id=?",
                 (after["http_available"], status, previous_status, after["http_ever_available"], now,
                  down_since, after["http_url"], json.dumps(after["http_metadata"]), asset_id))
-            for kind in http_events(before, status):
+            for kind in http_events(before, status, url):
                 self._event(asset_id, kind, before, after)
             if status is not None:
                 event_id = self.connection.execute("SELECT COALESCE(MAX(id),0) FROM events WHERE asset_id=?",
