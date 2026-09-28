@@ -341,8 +341,8 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 def __getattr__(self, name):
                     async def run(target, **options):
                         key = name, target["name"]
-                        if key in active:
-                            overlaps.append((key, "duplicate execution"))
+                        if active:
+                            overlaps.append((key, "overlapping module execution"))
                         active.add(key)
                         try:
                             counts[key] = counts.get(key, 0) + 1

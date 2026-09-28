@@ -81,15 +81,18 @@ Use `assetwatch --config /path/to/config.yaml ...` for another configuration.
 Relative database, log, executable and wordlist paths follow the YAML file's
 directory. Bare executable names are resolved through PATH.
 
-Six independent asynchronous tasks run passive discovery, TLSX, DNSX (A and CNAME),
-HTTPX, DNS brute force and PTR discovery. Another task polls notifications at `intervals.monitoring`, draining
+Passive discovery, TLSX, DNSX (A and CNAME), HTTPX, DNS brute force and PTR discovery
+share **one FIFO module queue** across all targets. Only one scan module runs at a
+time, from its first tool call through final ingestion. The loop keeps checking
+persisted deadlines and queues due work; modules waiting for their turn show
+`queued`, and only the active module shows `running`. Another task polls notifications at `intervals.monitoring`, draining
 full successful batches without waiting for another interval; state
-comparison happens immediately when observations are committed. Each task processes
-targets sequentially. All scan tools share **one FIFO execution slot** across all
-targets, with bounded tool threads and a configurable overall timeout. DNSGen seed
-batches and static/dynamic ShuffleDNS chunks release that slot between invocations,
-so DNS and HTTP monitoring can run during a long brute-force cycle. Waiting work is
-bounded by the watcher count; no task/thread is created per hostname. Telegram delivery,
+comparison happens immediately when observations are committed. Each watcher queues
+one target at a time, so waiting work is bounded by the watcher count; no task/thread
+is created per hostname. Tools retain bounded threads and a configurable timeout
+per invocation. DNSGen batches and static/dynamic ShuffleDNS chunks stay together
+in their module's turn, including cooldowns; DNS/HTTP scans wait until that turn ends.
+Brute-force findings enter the persistent monitoring queue immediately. Telegram delivery,
 program feeds and CLI inspection remain available. Subfinder, Chaos and crt.sh run each passive
 cycle, with failures isolated by source and domain.
 Subfinder receives `-recursive`, selecting sources that support recursive
@@ -106,9 +109,12 @@ HTTP keep both jobs. Successful batches survive restarts without repeating the w
 target, and interrupted batches remain due. New findings do not wait for the target's
 next full discovery cycle. Newly added targets are picked up without restarting.
 Failed or partially inconclusive runs retry after the smaller of their normal interval
-and `runtime.failure_retry_interval` (default 300 seconds). This also applies to
-previously failed runs stored before upgrading, so a missing resolver file no longer
-postpones another attempt for a week. Interrupted runs are retried on restart.
+and `runtime.failure_retry_interval` (default 300 seconds), **except DNS brute force**.
+DNS brute force always waits `intervals.dns_bruteforce` (604800 seconds / one week
+by default) after a completed run, including failed or partial runs. If interrupted,
+its deadline is measured from its saved start time, so restarting does not trigger
+another weekly attempt. A run that was only queued has not used its turn and remains
+due. Other interrupted modules retry on restart; monitoring retains per-asset deadlines.
 Use `assetwatch rerun dns_bruteforce --target example` to queue a run immediately;
 it still waits for scan access and requires the daemon to be running. Repeated
 requests deduplicate; a request made during a run schedules one additional run.
@@ -146,8 +152,9 @@ Candidate export and output ingestion use bounded batches and temporary files.
 `dns_bruteforce.dynamic.chunk_size` bounds cached names sent to each ShuffleDNS run
 (both default to 5000). The wordlist is streamed, not accumulated as a list of chunks.
 `dns_bruteforce.shuffledns.cooldown` pauses between chunks (default one second).
-Failed chunks are logged and other chunks continue; failed cycles retry on the failure
-interval. A retry may revisit successful brute-force chunks, with findings deduplicated.
+Failed chunks are logged and other chunks continue; failed cycles wait for the next
+brute-force interval or an explicit `rerun`. A later run may revisit successful
+brute-force chunks, with findings deduplicated.
 The cache grows on disk as findings accumulate; removing a target also removes its
 candidate cache and checkpoint. Existing databases gain these tables automatically.
 

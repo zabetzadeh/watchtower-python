@@ -601,6 +601,14 @@ class Database:
             return row[0] if row[0] is not None else float("inf")
         row = self.connection.execute(
             "SELECT finished_at,success FROM watcher_runs WHERE target_id=? AND watcher=?", (target_id, watcher)).fetchone()
+        if watcher == "dns_bruteforce":
+            # A failed/partial weekly run must not become a five-minute loop.
+            # An interrupted attempt uses its durable start time, including after
+            # a crash; merely waiting in the module queue does not count as a run.
+            status = self.connection.execute(
+                "SELECT started_at FROM watcher_status WHERE target_id=? AND watcher=?", (target_id, watcher)).fetchone()
+            last_attempt = max(row["finished_at"] if row else 0, (status["started_at"] or 0) if status else 0)
+            return last_attempt + interval if row or (status and status["started_at"] is not None) else 0
         if row and not row["success"] and retry_interval is not None:
             interval = min(interval, retry_interval)
         return row["finished_at"] + interval if row else 0

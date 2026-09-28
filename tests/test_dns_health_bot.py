@@ -113,12 +113,15 @@ class StateTests(Fixture, unittest.TestCase):
                 self.db.observe_cnames(asset_id, [])
         self.assertEqual(self.asset(), before)
 
-    def test_failed_weekly_run_retry_and_manual_request_survive_restart(self):
+    def test_failed_weekly_run_keeps_interval_and_manual_request_survives_restart(self):
         target_id = self.target["id"]
         with patch("assetwatch.database.time.time", return_value=1000):
             self.db.finished(target_id, "dns_bruteforce", False)
-        self.assertEqual(self.db.next_run_at(target_id, "dns_bruteforce", 604800, 300), 1300)
+        self.reopen()
+        self.assertEqual(self.db.next_run_at(target_id, "dns_bruteforce", 604800, 300), 605800)
         with patch("assetwatch.database.time.time", return_value=1300):
+            self.assertFalse(self.db.due(target_id, "dns_bruteforce", 604800, 300))
+        with patch("assetwatch.database.time.time", return_value=605800):
             self.assertTrue(self.db.due(target_id, "dns_bruteforce", 604800, 300))
         self.db.finished(target_id, "dns_bruteforce", True)
         self.assertFalse(self.db.due(target_id, "dns_bruteforce", 604800, 300))
@@ -340,14 +343,14 @@ class AsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(chunks), expected)
         self.assertTrue(all(len(chunk.encode("utf-16-le")) // 2 <= 3800 for chunk in chunks))
 
-    async def test_scheduler_failed_run_retries_without_weekly_delay_and_records_cancellation(self):
+    async def test_scheduler_other_failed_modules_retry_and_record_cancellation(self):
         self.config["runtime"].update(poll_interval=0.005, failure_retry_interval=0.01)
         started = asyncio.Event()
 
         class Failing:
             calls = 0
 
-            async def dns_bruteforce(self, target):
+            async def tlsx(self, target):
                 self.calls += 1
                 if self.calls == 1:
                     raise ToolError("fixture failure")
@@ -356,7 +359,7 @@ class AsyncTests(Fixture, unittest.IsolatedAsyncioTestCase):
 
         watcher = Failing()
         scheduler = Scheduler(self.config, self.db, watcher)
-        task = asyncio.create_task(scheduler.watch("dns_bruteforce"))
+        task = asyncio.create_task(scheduler.watch("tlsx"))
         try:
             await asyncio.wait_for(started.wait(), 1)
             self.assertEqual(watcher.calls, 2)

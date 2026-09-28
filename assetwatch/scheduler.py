@@ -1,4 +1,4 @@
-"""Independent bounded watcher tasks; one daemon may own a database."""
+"""FIFO module runs with independent deadlines; one daemon owns the database."""
 
 import asyncio
 import logging
@@ -43,6 +43,9 @@ class Scheduler:
         self.watchers = watchers or Watchers(config, database)
         self.notifier = notifier or Notifier(config, database)
         self.programs = ProgramWatcher(config, database)
+        # Keep whole modules together, including ingestion and tool cooldowns.
+        # Each watcher can queue one target at a time; Lock waiters are FIFO.
+        self.scan_slot = asyncio.Lock()
 
     async def watch(self, name):
         interval = self.config["intervals"][name]
@@ -60,31 +63,42 @@ class Scheduler:
                         continue
                     LOG.info("watcher=%s target=%s state=queued", name, target["name"])
                     self.db.watcher_state(target["id"], name, "queued",
-                                          "Waiting for bounded tool queue")
-                    success = False
-                    try:
-                        self.db.consume_run_request(target["id"], name)
-                        self.db.watcher_state(target["id"], name, "running", "Started; tools use the shared queue")
-                        LOG.info("watcher=%s target=%s state=started", name, target["name"])
-                        options = {"queued_only": True} if name in {"dns_resolution", "http_probe"} else {}
-                        success = await getattr(self.watchers, name)(target, **options)
-                    except asyncio.CancelledError:
-                        self.db.watcher_state(target["id"], name, "interrupted", "Daemon stopped; run will be retried")
-                        if name not in {"dns_resolution", "http_probe"}:
-                            self.db.request_run(target["id"], name)
-                        raise
-                    except Exception as error:
-                        reason = redact(self.config, str(error))[:1000]
-                        self.db.watcher_progress(target["id"], name, reason, error=reason)
-                        LOG.error("watcher=%s target=%s state=failed error=%s", name, target["name"], error)
-                    self.db.finished(target["id"], name, bool(success))
-                    next_run = self.db.next_run_at(target["id"], name, interval, retry_interval)
-                    LOG.info("watcher=%s target=%s state=finished success=%s next_run=%s",
-                             name, target["name"], success, self.display_time(next_run))
+                                          "Waiting for the FIFO module queue")
+                    async with self.scan_slot:
+                        # Target scope can change while another module is running.
+                        current = next((item for item in self.db.targets() if item["id"] == target["id"]), None)
+                        if current is None:
+                            continue
+                        await self.execute(name, current, interval, retry_interval)
                     announced.add(target["id"])
             except Exception as error:
                 LOG.error("watcher=%s scheduler_error=%s", name, error)
             await asyncio.sleep(self.config["runtime"]["poll_interval"])
+
+    async def execute(self, name, target, interval, retry_interval):
+        success = False
+        try:
+            with self.db.transaction():
+                self.db.consume_run_request(target["id"], name)
+                self.db.watcher_state(target["id"], name, "running", "Started; owns the module queue")
+            LOG.info("watcher=%s target=%s state=started", name, target["name"])
+            options = {"queued_only": True} if name in {"dns_resolution", "http_probe"} else {}
+            success = await getattr(self.watchers, name)(target, **options)
+        except asyncio.CancelledError:
+            detail = ("Daemon stopped; next attempt follows the configured interval"
+                      if name == "dns_bruteforce" else "Daemon stopped; run will be retried")
+            self.db.watcher_state(target["id"], name, "interrupted", detail)
+            if name not in {"dns_resolution", "http_probe", "dns_bruteforce"}:
+                self.db.request_run(target["id"], name)
+            raise
+        except Exception as error:
+            reason = redact(self.config, str(error))[:1000]
+            self.db.watcher_progress(target["id"], name, reason, error=reason)
+            LOG.error("watcher=%s target=%s state=failed error=%s", name, target["name"], error)
+        self.db.finished(target["id"], name, bool(success))
+        next_run = self.db.next_run_at(target["id"], name, interval, retry_interval)
+        LOG.info("watcher=%s target=%s state=finished success=%s next_run=%s",
+                 name, target["name"], success, self.display_time(next_run))
 
     @staticmethod
     def display_time(timestamp):
@@ -118,9 +132,11 @@ class Scheduler:
         stop = stop or asyncio.Event()
         loop = asyncio.get_running_loop()
         for row in self.db.connection.execute("SELECT target_id,watcher FROM watcher_status WHERE state IN ('running','queued','interrupted')"):
-            if row["watcher"] not in {"dns_resolution", "http_probe"}:
+            if row["watcher"] not in {"dns_resolution", "http_probe", "dns_bruteforce"}:
                 self.db.request_run(row["target_id"], row["watcher"])
-            self.db.watcher_state(row["target_id"], row["watcher"], "interrupted", "Previous run interrupted; retry queued")
+            detail = ("Previous run interrupted; next attempt follows the configured interval"
+                      if row["watcher"] == "dns_bruteforce" else "Previous run interrupted; retry queued")
+            self.db.watcher_state(row["target_id"], row["watcher"], "interrupted", detail)
         if own_signals:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, stop.set)

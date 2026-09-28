@@ -293,8 +293,8 @@ class Watchers:
                 failures.append("dnsgen")
             LOG.info("target=%s tool=dnsgen new_seeds=%s new_candidates=%s", target["name"], seeds, new_candidates)
 
-            # Each cached chunk takes one tool slot. Monitoring gets a turn between
-            # chunks, and ShuffleDNS never loads an entire target's cache at once.
+            # Bound each invocation without loading the entire target cache.
+            # The scheduler keeps this module's chunks in one queued run.
             path = directory / "candidates.txt"
             chunk_size = self.config["dns_bruteforce"]["dynamic"]["chunk_size"]
             cooldown = self.config["dns_bruteforce"]["shuffledns"]["cooldown"]
